@@ -134,10 +134,15 @@ interface ReviewData {
   devicesign: string;
 }
 
-/** 上游错误体：兼容 error_code/error/error_description 与 result:review 两种形态 */
+/** 上游错误体：兼容两类形态
+ *  - v3/login：{ error, errorCode, errorDesc, error_description, result }（HTTP 200 携带）
+ *  - captcha/init、signin/token：{ error_code, error, error_description }
+ */
 interface ApiErrorBody {
   error_code?: number;
+  errorCode?: string | number;
   error?: string;
+  errorDesc?: string;
   error_description?: string;
   result?: string;
 }
@@ -405,6 +410,11 @@ class XunleiCommon {
     }
     const err = (json ?? {}) as ApiErrorBody;
     const isError = err.error_code !== undefined && err.error_code !== 0;
+    // v3/login 错误形态（HTTP 200）：error/errorCode/errorDesc/error_description，且成功时不携带 error
+    const hasV3Error =
+      (err.error && err.error !== 'success') ||
+      err.errorDesc !== undefined ||
+      (err.errorCode !== undefined && String(err.errorCode) !== '0');
     // 风控拦截：error=review_panel（AList 判断）或 result=review（实测形态）
     const isReview =
       err.error === 'review_panel' ||
@@ -413,9 +423,17 @@ class XunleiCommon {
     if (isReview) {
       throw this.buildReviewError(json as Record<string, unknown>);
     }
-    if (isError || (err.error && err.error !== 'success')) {
-      const msg = err.error_description || err.error || `error_code=${err.error_code}`;
-      const e = new AuthProviderError(`迅雷返回错误：${msg}`, 502, 'upstream');
+    if (isError || hasV3Error) {
+      // 标注接口来源，便于定位是哪一步返回
+      const source = url.includes('v3/login')
+        ? 'v3 登录'
+        : url.includes('signin/token')
+          ? '换取令牌'
+          : '验证码初始化';
+      const desc = err.errorDesc || err.error_description || err.error || '';
+      const code = err.error_code !== undefined ? err.error_code : err.errorCode;
+      const msg = `迅雷${source}返回错误：${desc || `error_code=${code}`}`;
+      const e = new AuthProviderError(msg, 502, 'upstream');
       if (typeof err.error_code === 'number') {
         (e as AuthProviderError & { code?: number }).code = err.error_code;
       }
