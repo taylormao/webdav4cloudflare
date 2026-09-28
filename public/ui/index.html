@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebDAV Cloud Drive</title>
+  <link rel="stylesheet" href="/ui/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">☁</span>
+      <span>WebDAV Cloud Drive</span>
+    </div>
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-tab="files">文件</button>
+      <button class="tab" data-tab="settings">存储配置</button>
+      <button class="tab" data-tab="logs">请求日志</button>
+    </nav>
+    <div class="userbox" id="userbox">
+      <span id="userName"></span>
+      <button class="btn btn-ghost" id="btnLogout" title="退出登录">退出</button>
+    </div>
+  </header>
+
+  <!-- 登录遮罩 -->
+  <div class="modal-overlay" id="loginOverlay">
+    <div class="modal login-card">
+      <h2>登录</h2>
+      <p class="hint">使用部署时配置的 WebDAV 账号密码（DAV_USER / DAV_PASS）</p>
+      <form id="loginForm">
+        <label>用户名
+          <input type="text" id="loginUser" autocomplete="username" required />
+        </label>
+        <label>密码
+          <input type="password" id="loginPass" autocomplete="current-password" required />
+        </label>
+        <button type="submit" class="btn btn-primary">登录</button>
+        <p class="error" id="loginError"></p>
+      </form>
+    </div>
+  </div>
+
+  <main>
+    <!-- 文件浏览 -->
+    <section id="view-files" class="view active">
+      <div class="toolbar">
+        <div class="breadcrumb" id="breadcrumb"></div>
+        <div class="actions">
+          <button class="btn" id="btnUp" title="返回上级目录（Alt+↑ / Backspace）" hidden>⬆ 上级目录</button>
+          <button class="btn" id="btnRefresh" title="刷新">刷新</button>
+          <button class="btn" id="btnNewFolder">新建文件夹</button>
+          <label class="btn btn-primary" for="fileInput">上传文件</label>
+          <input type="file" id="fileInput" multiple hidden />
+        </div>
+      </div>
+      <div class="file-table-wrap">
+        <table class="file-table">
+          <thead>
+            <tr><th>名称</th><th class="col-size">大小</th><th class="col-time">修改时间</th><th class="col-ops">操作</th></tr>
+          </thead>
+          <tbody id="fileList"></tbody>
+        </table>
+        <div class="empty" id="fileEmpty" hidden>目录为空</div>
+        <div class="error-banner" id="fileError" hidden></div>
+      </div>
+      <div class="upload-progress" id="uploadProgress" hidden></div>
+    </section>
+
+    <!-- 存储配置（Web UI 自助配置存储服务） -->
+    <section id="view-settings" class="view">
+      <h2>存储服务自助配置</h2>
+      <div id="settingsContent" class="cards"></div>
+    </section>
+
+    <!-- 请求日志 -->
+    <section id="view-logs" class="view">
+      <div class="toolbar">
+        <h2>请求日志（D1）</h2>
+        <div class="actions">
+          <select id="logMethod">
+            <option value="">全部方法</option>
+            <option>PROPFIND</option>
+            <option>GET</option>
+            <option>PUT</option>
+            <option>DELETE</option>
+            <option>MKCOL</option>
+            <option>MOVE</option>
+            <option>COPY</option>
+            <option>LOCK</option>
+            <option>UNLOCK</option>
+            <option>OPTIONS</option>
+          </select>
+          <select id="logStatus">
+            <option value="">全部状态</option>
+            <option value="200">200</option>
+            <option value="201">201</option>
+            <option value="207">207</option>
+            <option value="401">401</option>
+            <option value="404">404</option>
+            <option value="409">409</option>
+            <option value="500">500</option>
+          </select>
+          <button class="btn" id="btnLogsRefresh">刷新</button>
+        </div>
+      </div>
+      <div id="logsContent"></div>
+    </section>
+  </main>
+
+  <script src="/ui/app.js"></script>
+</body>
+</html>

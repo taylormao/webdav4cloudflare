@@ -1,0 +1,89 @@
+﻿# WebDAV Cloud Drive 鈥?Wrangler 閰嶇疆
+# 鏂囨。: https://developers.cloudflare.com/workers/wrangler/configuration/
+
+name = "webdav-cloud-drive"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ---------------------------------------------------------------------------
+# 闈欐€佽祫婧愶紙Web UI锛夌敱 Worker 鐩存帴鎵樼锛屾棤闇€鍗曠嫭閮ㄧ讲 Pages
+# 閮ㄧ讲鍚庤闂?https://<worker>/ui/ 鎵撳紑绠＄悊鐣岄潰
+# ---------------------------------------------------------------------------
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+# ---------------------------------------------------------------------------
+# 鍙橀噺锛堥潪鏁忔劅閰嶇疆锛?# ---------------------------------------------------------------------------
+[vars]
+# 褰撳墠鍚敤鐨勫瓨鍌ㄥ悗绔? s3 | telegram | baidu | gdrive | dropbox
+STORAGE_TYPE = "gdrive"
+# 璇锋眰鏃ュ織寮€鍏筹紙闇€鍚屾椂缁戝畾 D1 鏁版嵁搴擄級
+LOG_ENABLED = "true"
+
+# ---------------------------------------------------------------------------
+# 鏁忔劅閰嶇疆涓€寰嬩娇鐢?Secret 娉ㄥ叆锛屼弗绂佸啓鍏ユ湰鏂囦欢锛?#   npx wrangler secret put DAV_USER
+#   npx wrangler secret put DAV_PASS
+#   npx wrangler secret put S3_ACCESS_KEY_ID
+#   npx wrangler secret put S3_SECRET_ACCESS_KEY
+#   npx wrangler secret put TELEGRAM_BOT_TOKEN
+#   npx wrangler secret put TELEGRAM_CHAT_ID
+#   npx wrangler secret put BAIDU_ACCESS_TOKEN
+#   npx wrangler secret put BAIDU_APP_ID
+#   npx wrangler secret put GDRIVE_CLIENT_ID
+#   npx wrangler secret put GDRIVE_CLIENT_SECRET
+#   npx wrangler secret put GDRIVE_REFRESH_TOKEN
+#   npx wrangler secret put DROPBOX_ACCESS_TOKEN        # 鎴栦笅鏂逛笁浠跺
+#   npx wrangler secret put DROPBOX_REFRESH_TOKEN
+#   npx wrangler secret put DROPBOX_APP_KEY
+#   npx wrangler secret put DROPBOX_APP_SECRET
+#
+# 鍏朵綑鍙€夊彉閲忥紙鍙斁 vars 鎴栫幆澧冭鐩栵級锛?#   S3_ENDPOINT / S3_REGION / S3_BUCKET / S3_FORCE_PATH_STYLE
+#   BAIDU_USER_AGENT
+
+# ---------------------------------------------------------------------------
+# KV 鍛藉悕绌洪棿锛圵ebDAV 閿?+ Telegram 绱㈠紩锛?#   npx wrangler kv namespace create DAV_LOCKS
+#   npx wrangler kv namespace create TELEGRAM_INDEX
+# ---------------------------------------------------------------------------
+[[kv_namespaces]]
+binding = "DAV_LOCKS"
+id = "080c2b29678340a4bfd710ebb626b3c6"
+
+[[kv_namespaces]]
+binding = "TELEGRAM_INDEX"
+id = "bd8eea0fca964d97b255907878666b0e"
+
+# ---------------------------------------------------------------------------
+# R2 瀛樺偍妗讹紙s3 椹卞姩浣跨敤锛涜嫢鐢?gdrive/dropbox/telegram/baidu 鍙拷鐣ワ級
+#   npx wrangler r2 bucket create webdav-cloud-drive
+# ---------------------------------------------------------------------------
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "webdav-cloud-drive"
+
+# ---------------------------------------------------------------------------
+# D1 鏁版嵁搴擄紙璇锋眰鏃ュ織鎸佷箙鍖栵級
+#   npx wrangler d1 create webdav-logs          # 鍒涘缓鍚庢妸 database_id 濉叆涓嬫柟
+#   npx wrangler d1 execute webdav-logs --remote --file=db/schema.sql
+# ---------------------------------------------------------------------------
+[[d1_databases]]
+binding = "LOGS_DB"
+database_name = "webdav-logs"
+database_id = "6f8c9934-076a-44e8-9ccf-e94271988fae"
+
+# ---------------------------------------------------------------------------
+# OAuth 鍥炶皟锛圙oogle Drive / Dropbox 鎺堟潈娴佺▼鍙€夛級銆?# 鑻ラ渶瑕?OAuth 鎺堟潈椤碉紝鍙湪 Cloudflare 浠〃鐩?Workers 璺敱涓厤缃細
+#   /oauth/gdrive  鈫?鑷畾涔?Worker 鎴栫敱鏈?Worker 鑷瀹炵幇锛堣 architecture.md锛?# 鏈」鐩噰鐢?refresh_token 鐩撮厤鏂瑰紡锛屼笉寮哄埗瑕佹眰鍥炶皟绔偣銆?# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# KV: DRIVER_CONFIG - user self-service storage driver configs (Web UI).
+# Deployment steps (replace the placeholder id below):
+#   npx wrangler kv namespace create DRIVER_CONFIG
+#   # paste the returned namespace id as the `id` value, then deploy.
+# ---------------------------------------------------------------------------
+[[kv_namespaces]]
+binding = "DRIVER_CONFIG"
+id = "d9cdcb14581c4dc3bef5d2c52dd01c5c"
+

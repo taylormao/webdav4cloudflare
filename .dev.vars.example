@@ -1,0 +1,52 @@
+# 本地开发环境变量模板
+# 复制为 .dev.vars 并填入真实值（wrangler dev 时自动加载）
+
+# ---- KV 绑定（可选） ----
+# 存储服务自助配置（Web UI /api/config）使用 KV namespace 持久化用户自填配置。
+# 生产部署前需创建 KV namespace 并在 wrangler.toml 中声明 DRIVER_CONFIG 绑定，
+# 本地开发则可先在 wrangler dev 会话内通过 KV API 写入模拟数据，或直接留空。
+# 说明：./wrangler.toml 中已声明 [[kv_namespaces]] binding = "DRIVER_CONFIG"；
+# 本地首次运行请执行 wrangler kv namespace create DRIVER_CONFIG 并按提示填入 id。
+
+# ---- 认证（必需） ----
+DAV_USER=admin
+DAV_PASS=changeme
+
+# ---- 存储类型：s3 | telegram | baidu | gdrive | dropbox | yun139 ----
+STORAGE_TYPE=s3
+
+# ---- 请求日志（D1，可选） ----
+LOG_ENABLED=true
+
+# ---- S3 / R2 ----
+S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com
+S3_REGION=auto
+S3_ACCESS_KEY_ID=
+S3_SECRET_ACCESS_KEY=
+S3_BUCKET=webdav-cloud-drive
+S3_FORCE_PATH_STYLE=false
+
+# ---- Telegram ----
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+
+# ---- 百度网盘 ----
+BAIDU_ACCESS_TOKEN=
+BAIDU_APP_ID=
+BAIDU_USER_AGENT=Mozilla/5.0 (WebDAV Cloud Drive)
+
+# ---- Google Drive（OAuth2 + Drive API v3） ----
+GDRIVE_CLIENT_ID=
+GDRIVE_CLIENT_SECRET=
+GDRIVE_REFRESH_TOKEN=
+
+# ---- Dropbox（API v2；access_token 或 refresh_token + app key/secret 二选一） ----
+DROPBOX_ACCESS_TOKEN=
+DROPBOX_REFRESH_TOKEN=
+DROPBOX_APP_KEY=
+DROPBOX_APP_SECRET=
+
+# ---- 中国移动云盘（139 / 和彩云，personal_new） ----
+# Authorization = base64("pc:<账号>:<token|...|exp>")，剩余有效期 <15 天自动刷新；
+# 刷新失败或已过期时需重新获取并更新此变量。
+YUN139_AUTHORIZATION=
