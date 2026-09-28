@@ -12,7 +12,7 @@
 DAV_USER=admin
 DAV_PASS=changeme
 
-# ---- 存储类型：s3 | telegram | baidu | gdrive | dropbox | yun139 ----
+# ---- 存储类型：s3 | telegram | baidu | gdrive | dropbox | yun139 | xunlei ----
 STORAGE_TYPE=s3
 
 # ---- 请求日志（D1，可选） ----
@@ -50,3 +50,12 @@ DROPBOX_APP_SECRET=
 # Authorization = base64("pc:<账号>:<token|...|exp>")，剩余有效期 <15 天自动刷新；
 # 刷新失败或已过期时需重新获取并更新此变量。
 YUN139_AUTHORIZATION=
+
+# ---- 迅雷网盘（thunder_browser 方案，API 基址 x-api-pan.xunlei.com/drive/v1） ----
+# refreshToken 为迅雷浏览器客户端令牌（必填，默认 30 天有效）；
+# accessToken 仅作缓存，缺失/过期时自动用 refreshToken 刷新；
+# accessTokenExpiresAt 为 accessToken 过期时间戳（秒，可选）；
+# refreshToken 过期后需重新获取并更新，暂不支持静默续期。
+XUNLEI_REFRESH_TOKEN=
+XUNLEI_ACCESS_TOKEN=
+XUNLEI_ACCESS_TOKEN_EXPIRES_AT=

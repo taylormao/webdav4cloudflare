@@ -8,7 +8,7 @@
 
 import { KV_DRIVER_KEYS, readKvDriverConfig, sanitizeDriverConfig, applyDriverConfigPatch } from './kv-config';
 
-export type StorageType = 's3' | 'telegram' | 'baidu' | 'gdrive' | 'dropbox' | 'yun139';
+export type StorageType = 's3' | 'telegram' | 'baidu' | 'gdrive' | 'dropbox' | 'yun139' | 'xunlei';
 
 export interface AuthConfig {
   user: string;
@@ -53,6 +53,32 @@ export interface Yun139Config {
   authorization: string;
 }
 
+/**
+ * 迅雷网盘配置（thunder_browser 方案，对应 AList ExpertAddition）：
+ * 必填 refreshToken（迅雷浏览器 com.xunlei.browser 客户端刷新令牌）；
+ * accessToken 等为运行时缓存字段，可在请求间回填复用；
+ * clientId/clientSecret/clientVersion/packageName 默认使用内置迅雷浏览器客户端凭据，可覆盖；
+ * deviceId 默认由 refreshToken 的 MD5 派生，可显式指定 32 位十六进制值；
+ * useVideoUrl 优先使用 medias 视频直链；removeWay 控制删除落回收站（trash，默认）或彻底删除（delete）；
+ * signTimestamp/signCaptchaSign 同时提供时使用显式验证码签名（captcha_sign 模式）。
+ */
+export interface XunleiConfig {
+  refreshToken: string;
+  accessToken?: string;
+  accessTokenExpiresAt?: number;
+  deviceId?: string;
+  clientId?: string;
+  clientSecret?: string;
+  clientVersion?: string;
+  packageName?: string;
+  userAgent?: string;
+  downloadUserAgent?: string;
+  useVideoUrl?: boolean;
+  removeWay?: string;
+  signTimestamp?: string;
+  signCaptchaSign?: string;
+}
+
 export interface LogConfig {
   enabled: boolean; // 是否写 D1 请求日志（LOG_ENABLED != 'false' 且已绑定 D1）
   table: string;
@@ -67,6 +93,7 @@ export interface AppConfig {
   gdrive: GDriveConfig;
   dropbox: DropboxConfig;
   yun139: Yun139Config;
+  xunlei: XunleiConfig;
   log: LogConfig;
 }
 
@@ -94,6 +121,20 @@ interface RawEnv {
   DROPBOX_APP_KEY?: string;
   DROPBOX_APP_SECRET?: string;
   YUN139_AUTHORIZATION?: string;
+  XUNLEI_REFRESH_TOKEN?: string;
+  XUNLEI_ACCESS_TOKEN?: string;
+  XUNLEI_ACCESS_TOKEN_EXPIRES_AT?: string;
+  XUNLEI_DEVICE_ID?: string;
+  XUNLEI_CLIENT_ID?: string;
+  XUNLEI_CLIENT_SECRET?: string;
+  XUNLEI_CLIENT_VERSION?: string;
+  XUNLEI_PACKAGE_NAME?: string;
+  XUNLEI_USER_AGENT?: string;
+  XUNLEI_DOWNLOAD_USER_AGENT?: string;
+  XUNLEI_USE_VIDEO_URL?: string;
+  XUNLEI_REMOVE_WAY?: string;
+  XUNLEI_SIGN_TIMESTAMP?: string;
+  XUNLEI_SIGN_CAPTCHA_SIGN?: string;
   LOG_ENABLED?: string;
   [key: string]: unknown;
 }
@@ -162,12 +203,36 @@ function buildBaseConfig(env: RawEnv): AppConfig {
     authorization: env.YUN139_AUTHORIZATION ?? '',
   };
 
+  const xunlei: XunleiConfig = {
+    refreshToken: env.XUNLEI_REFRESH_TOKEN ?? '',
+    accessToken: env.XUNLEI_ACCESS_TOKEN ?? undefined,
+    accessTokenExpiresAt: parseTimestamp(env.XUNLEI_ACCESS_TOKEN_EXPIRES_AT),
+    deviceId: env.XUNLEI_DEVICE_ID ?? undefined,
+    clientId: env.XUNLEI_CLIENT_ID ?? undefined,
+    clientSecret: env.XUNLEI_CLIENT_SECRET ?? undefined,
+    clientVersion: env.XUNLEI_CLIENT_VERSION ?? undefined,
+    packageName: env.XUNLEI_PACKAGE_NAME ?? undefined,
+    userAgent: env.XUNLEI_USER_AGENT ?? undefined,
+    downloadUserAgent: env.XUNLEI_DOWNLOAD_USER_AGENT ?? undefined,
+    useVideoUrl: (env.XUNLEI_USE_VIDEO_URL ?? 'false') === 'true',
+    removeWay: env.XUNLEI_REMOVE_WAY ?? undefined,
+    signTimestamp: env.XUNLEI_SIGN_TIMESTAMP ?? undefined,
+    signCaptchaSign: env.XUNLEI_SIGN_CAPTCHA_SIGN ?? undefined,
+  };
+
   const log: LogConfig = {
     enabled: (env.LOG_ENABLED ?? 'true') !== 'false',
     table: 'webdav_logs',
   };
 
-  return { storageType, auth, s3, telegram, baidu, gdrive, dropbox, yun139, log };
+  return { storageType, auth, s3, telegram, baidu, gdrive, dropbox, yun139, xunlei, log };
+}
+
+/** 解析可选数字环境变量（空/非法返回 undefined，供 accessTokenExpiresAt 等时间戳使用） */
+function parseTimestamp(v?: string): number | undefined {
+  if (v === undefined || v === '') return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
 }
 
 function normalizeStorageType(v?: string): StorageType {
@@ -178,6 +243,7 @@ function normalizeStorageType(v?: string): StorageType {
     case 'gdrive':
     case 'dropbox':
     case 'yun139':
+    case 'xunlei':
       return v;
     default:
       return 's3';
@@ -202,6 +268,8 @@ export function driverConfigured(key: string, cfg: AppConfig): boolean {
       );
     case 'yun139':
       return !!cfg.yun139.authorization;
+    case 'xunlei':
+      return !!cfg.xunlei.refreshToken;
     default:
       return false;
   }

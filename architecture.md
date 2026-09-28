@@ -92,6 +92,7 @@ interface StorageDriver {
 | 百度网盘 | 开放平台本身即文件系统语义，直接使用 API |
 | Google Drive | Drive 本身无目录概念；实现"虚拟目录 = 类型为 folder 的 Drive 文件"，按路径逐级解析 fileId |
 | Dropbox | Dropbox 本身即文件系统语义，路径直接映射（去掉 WebDAV 目录尾斜杠） |
+| 迅雷网盘 | 开放平台本身即文件系统语义；`list/stat` 按路径逐级解析 fileId（实例 Map 缓存父目录），上传走 S3 兼容分片（AWS SigV4），下载走 getFileLink 302 直链 |
 
 ## 3. 模块划分（目录结构）
 
@@ -143,7 +144,8 @@ webdav-cloud-drive/
         ├── telegram.ts           # Telegram Bot 存储（KV 索引）
         ├── baidu.ts              # 百度网盘开放平台驱动
         ├── gdrive.ts             # Google Drive（OAuth2 + Drive API v3）
-        └── dropbox.ts            # Dropbox（API v2，token 或 refresh_token）
+        ├── dropbox.ts            # Dropbox（API v2，token 或 refresh_token）
+        └── xunlei.ts             # 迅雷网盘（thunder_browser 方案，refresh_token）
 ```
 
 ## 4. 关键设计决策
@@ -216,7 +218,7 @@ webdav-cloud-drive/
 ### 10.2 KV 持久化（DRIVER_CONFIG）
 
 - 新增独立 KV namespace：**`DRIVER_CONFIG`**（`wrangler.toml` 中 `[[kv_namespaces]] binding = "DRIVER_CONFIG"`）。
-- Key = 驱动类型名（`s3` / `telegram` / `baidu` / `gdrive` / `dropbox` / `yun139`），Value = 该驱动完整 Config 对象的 JSON 字符串。
+- Key = 驱动类型名（`s3` / `telegram` / `baidu` / `gdrive` / `dropbox` / `yun139` / `xunlei`），Value = 该驱动完整 Config 对象的 JSON 字符串。
 - 部署前置：`npx wrangler kv namespace create DRIVER_CONFIG` 后将返回的 `id` 填入 `wrangler.toml`。
 
 ### 10.3 后端 API（/api/config，复用 DAV_USER/DAV_PASS Basic 鉴权）
@@ -262,7 +264,7 @@ buildConfig(env, kv?)  [async]
 
 ### 6.1 多驱动装配（A）
 
-- `registry.ts` 以 `createDrivers(config, env): Map<string, StorageDriver>` 取代单实例工厂：对凭据完整的 s3 / telegram / baidu / gdrive / dropbox 逐一创建驱动实例，key 为驱动类型名。
+- `registry.ts` 以 `createDrivers(config, env): Map<string, StorageDriver>` 取代单实例工厂：对凭据完整的 s3 / telegram / baidu / gdrive / dropbox / yun139 / xunlei 逐一创建驱动实例，key 为驱动类型名。
 - 凭据完整性判定由 `config.driverConfigured(key, config)` 统一提供，registry 装配与 `/api/settings` 展示共用同一口径。
 - 无任何驱动配置时 Map 为空：根目录 PROPFIND 返回空列表，`/api/settings` 提示无可用存储。
 
@@ -284,6 +286,37 @@ buildConfig(env, kv?)  [async]
 - `/api/download` 同步支持 `Range`（206），供前端大文件分片下载。
 - 前端分片下载：文件 >50MB 时按并发 6 片均分，单片 clamp 至 ≤80MB（`chunkSize = min(80MB, size/6)`），并发 Range 请求、整体进度条、按序拼接 Blob 后触发保存；小文件保持单请求直下。
 - 超大文本预览：`/api/preview` 对文本类内容用 `readUpTo` 截断至前 500KB（附 `X-Preview-Truncated: 1`），前端提示已截断。
+
+## 6.5 迅雷网盘驱动（xunlei，thunder_browser 方案）
+
+### 6.5.1 方案来源与鉴权
+
+- 驱动 `xunlei.ts` 移植自 AList `thunder_browser` 驱动（内置 `com.xunlei.browser` 客户端凭据），API 基址 `https://x-api-pan.xunlei.com/drive/v1`。
+- 必填凭据为 `refreshToken`（迅雷浏览器客户端的刷新令牌）；`accessToken` 仅作缓存，缺失/过期时用 refreshToken 刷新。
+- 刷新令牌默认 30 天有效（AList 语义 `Valid: true` 时以 `expires_in` 为准，否则按 30 天乐观处理）；剩余有效期不足 15 天（`exp < now + 15d`）且无 refreshToken 时拒绝访问。
+- 请求鉴权：`Bearer <accessToken>` + `X-Captcha-Token`（`sign` 签名字段，基于客户端 ID/Secret 与请求体哈希的 SHA1 签名）。
+
+### 6.5.2 路径与目录模型
+
+- 虚拟根分区名 `xunlei/`；内部路径以 `/` 开头、目录以 `/` 结尾，与 StorageDriver 契约一致。
+- `list`：`POST /drive/v1/files`（parentID=根时取 `root` 的 fileId），返回子项并映射 `FileStat`。
+- `stat`：按路径逐级解析父目录 fileId（实例内 `Map<path, fileId>` 缓存父目录解析结果，失效自动重查）。
+- `mkdir`：`POST /drive/v1/files`（kind=folder），幂等处理"同名已存在"。
+
+### 6.5.3 传输
+
+- 下载：`POST /drive/v1/files/{fileId}/download` 取 302 直链，`read()` 跟随重定向流式返回，支持 `Range`（透传 `Range` 头）。
+- 上传（小文件）：`POST /drive/v1/files`（kind=file，父目录 uploadType=resumable）→ 单请求 PUT 到 `resumable.params` 的 S3 预签名 URL（AWS SigV4）。
+- 上传（大文件，>5MB）：AList resumable 上传逻辑逐行移植：`PUT /drive/v1/files/{fileId}/content` 建任务 → 按 5MB 分片经 `resumable.params`（S3 预签名）逐个 `PUT` → `POST /drive/v1/files/{fileId}/content` 完成。GCID（迅雷内容指纹）与 S3 SigV4 签名均为纯 TS 实现（SHA1/HMAC/UTF-8 手写，避免依赖 node:crypto）。
+- `move` / `copy` / `remove` 走 `POST /drive/v1/files/{fileId}/move|copy|trash`（remove 即移入回收站 trash）。
+
+### 6.5.4 已知限制
+
+- **token 过期需人工刷新**：当前实现仅在访问时发现凭据失效返回明确错误；`refreshToken` 本身过期后无法静默续期，需用户重新获取并更新凭据（后续迭代将增加 token 过期前定时任务提醒）。
+- **Workers 请求体限制**：上传受 Cloudflare Workers 单请求体上限约束，超 100MB 文件在浏览器端需依赖分片/外部工具；下载不受影响（流式）。
+- **captcha 签名依赖客户端固定密钥**：签名仅用于满足 API 的 `X-Captcha-Token` 校验，不保证长期有效；若迅雷收紧校验，需更新签名算法或切换开放平台方案（`alist_thunder`）。
+- 未实现：分享/离线下载/秒传等迅雷特有能力，仅覆盖 WebDAV 基本文件语义。
+- 目录删除为非空递归（trash 语义），与 WebDAV DELETE 的递归行为一致。
 
 ## 7. 扩展新存储驱动指南
 

@@ -14,7 +14,7 @@
 import type { AppConfig, StorageType } from './config';
 
 /** 可自助配置的驱动类型（与 StorageType 一致） */
-export const KV_DRIVER_KEYS: StorageType[] = ['s3', 'telegram', 'baidu', 'gdrive', 'dropbox', 'yun139'];
+export const KV_DRIVER_KEYS: StorageType[] = ['s3', 'telegram', 'baidu', 'gdrive', 'dropbox', 'yun139', 'xunlei'];
 
 /** 驱动字段元数据：后端校验 + 脱敏元数据 + 前端表单渲染共用 */
 export interface DriverFieldSchema {
@@ -57,6 +57,22 @@ export const DRIVER_FIELD_SCHEMAS: Record<StorageType, DriverFieldSchema[]> = {
   ],
   yun139: [
     { name: 'authorization', type: 'string', required: true, secret: true, hint: 'base64("pc:<账号>:<token|...|exp>")（敏感）' },
+  ],
+  xunlei: [
+    { name: 'refreshToken', type: 'string', required: true, secret: true, hint: '迅雷浏览器 refresh_token（敏感）' },
+    { name: 'accessToken', type: 'string', required: false, secret: true, hint: 'access_token 缓存（可选，敏感；过期自动用 refreshToken 刷新）' },
+    { name: 'accessTokenExpiresAt', type: 'string', required: false, secret: false, hint: 'access_token 过期时间戳（秒，可选）' },
+    { name: 'deviceId', type: 'string', required: false, secret: false, hint: '设备 ID（32 位十六进制；留空自动由 refreshToken 派生）' },
+    { name: 'clientId', type: 'string', required: false, secret: false, default: 'ZUBzD9J_XPXfn7f7', hint: '客户端 ID（默认迅雷浏览器内置值）' },
+    { name: 'clientSecret', type: 'string', required: false, secret: true, hint: '客户端密钥（默认迅雷浏览器内置值，敏感）' },
+    { name: 'clientVersion', type: 'string', required: false, secret: false, default: '1.10.0.2633', hint: '客户端版本（默认迅雷浏览器内置值）' },
+    { name: 'packageName', type: 'string', required: false, secret: false, default: 'com.xunlei.browser', hint: '包名（默认迅雷浏览器）' },
+    { name: 'userAgent', type: 'string', required: false, secret: false, hint: '请求 UA（可选，默认自动生成）' },
+    { name: 'downloadUserAgent', type: 'string', required: false, secret: false, hint: '下载 UA（可选，默认 AndroidDownloadManager）' },
+    { name: 'useVideoUrl', type: 'boolean', required: false, secret: false, default: false, hint: '优先使用视频媒体直链下载' },
+    { name: 'removeWay', type: 'string', required: false, secret: false, default: 'trash', hint: '删除方式：trash（回收站，默认）/ delete（彻底删除）' },
+    { name: 'signTimestamp', type: 'string', required: false, secret: false, hint: '验证码签名时间戳（显式签名模式；与下方 signCaptchaSign 成对）' },
+    { name: 'signCaptchaSign', type: 'string', required: false, secret: false, hint: '验证码签名值（显式签名模式；与上方 signTimestamp 成对）' },
   ],
 };
 

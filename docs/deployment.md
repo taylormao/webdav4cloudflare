@@ -107,7 +107,7 @@ npx wrangler secret put GDRIVE_REFRESH_TOKEN    # Google Drive 离线 refresh_to
 `wrangler secret put` 流程（无需改代码、无需重新部署）：
 
 - 配置以 JSON 持久化到 `DRIVER_CONFIG` KV namespace，key 为驱动类型名
-  （`s3` / `telegram` / `baidu` / `gdrive` / `dropbox` / `yun139`）；
+  （`s3` / `telegram` / `baidu` / `gdrive` / `dropbox` / `yun139` / `xunlei`）；
 - 用户自填配置**优先**于环境变量，env Secret 作为兜底默认值；
 - 保存后下一次请求即按新配置装配驱动（配置合并发生在每次请求的装配链路中）；
 - 页面仅回显字段是否已配置及其来源（页面 / 环境变量），**永不回显明文凭据**；

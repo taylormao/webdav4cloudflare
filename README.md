@@ -2,7 +2,7 @@
 
 基于 **Cloudflare Workers** 的 WebDAV 云盘服务：一个可直接部署的 WebDAV 服务器 + 浏览器
 Web UI，可挂载到 Windows 资源管理器 / macOS Finder / rclone / Cyberduck / RaiDrive，
-支持 **Google Drive、Telegram、S3（R2）、百度网盘、Dropbox、中国移动云盘（139/和彩云）**
+支持 **Google Drive、Telegram、S3（R2）、百度网盘、Dropbox、中国移动云盘（139/和彩云）、迅雷网盘**
 多种存储后端。
 借助 Cloudflare 边缘网络，**无需本地任何代理**即可直接对外网网盘文件执行增删改操作。
 
@@ -12,7 +12,7 @@ Web UI，可挂载到 Windows 资源管理器 / macOS Finder / rclone / Cyberduc
   DELETE / MOVE / COPY / LOCK / UNLOCK，HTTP Basic Auth 鉴权（`DAV_USER` / `DAV_PASS`）。
 - **多存储虚拟根分区**：根路径按已装配驱动列出分区（`/gdrive/`、`/telegram/` 等），
   协议层与驱动层完全解耦；只配单一驱动时兼容无前缀根路径直接映射。
-- **六种存储后端**，统一 `StorageDriver` 接口：
+- **七种存储后端**，统一 `StorageDriver` 接口：
 
   | 类型 | `STORAGE_TYPE` | 后端 |
   | --- | --- | --- |
@@ -22,6 +22,7 @@ Web UI，可挂载到 Windows 资源管理器 / macOS Finder / rclone / Cyberduc
   | 百度网盘 | `baidu` | 百度开放平台 xpan REST API |
   | Dropbox | `dropbox` | Dropbox API v2（token / refresh_token） |
   | 中国移动云盘 | `yun139` | 139/和彩云 personal_new API（Authorization 凭据，token 自动刷新） |
+  | 迅雷网盘 | `xunlei` | 迅雷网盘 API（thunder_browser 方案，refresh_token + 自动刷新，S3 分片上传） |
 
 - **Telegram 入站自动同步**：向配置的 chat 发送文件后，list/stat 时自动增量拉取
   `getUpdates` 同步到分区根目录（`>20MB` 跳过，同名加 `-1` 后缀，offset 存 KV）。
@@ -89,9 +90,9 @@ webdav-cloud-drive/
         ├── baidu.ts               # 百度网盘驱动
         ├── gdrive.ts              # Google Drive 驱动（含原生格式导出）
         ├── dropbox.ts             # Dropbox 驱动
-        └── yun139.ts              # 中国移动云盘驱动（139/和彩云 personal_new）
+        ├── yun139.ts              # 中国移动云盘驱动（139/和彩云 personal_new）
+        └── xunlei.ts              # 迅雷网盘驱动（thunder_browser 方案）
 ```
-
 ## 快速开始
 
 ```bash
@@ -139,6 +140,7 @@ npx wrangler deploy
 | `gdrive` | `GDRIVE_CLIENT_ID` / `GDRIVE_CLIENT_SECRET` / `GDRIVE_REFRESH_TOKEN` | `GDRIVE_ROOT_ID` |
 | `dropbox` | `DROPBOX_ACCESS_TOKEN`（或 `DROPBOX_REFRESH_TOKEN` + `DROPBOX_APP_KEY` + `DROPBOX_APP_SECRET`） | — |
 | `yun139` | `YUN139_AUTHORIZATION`（base64("pc:\<账号\>:\<token\|...\|exp\>")） | — |
+| `xunlei` | `XUNLEI_REFRESH_TOKEN` | `XUNLEI_ACCESS_TOKEN`（可选缓存，缺失自动刷新） |
 
 **Google Drive refresh_token 获取**（一次性）：
 
@@ -172,6 +174,9 @@ npx wrangler deploy
   Workers 响应体与 CPU 时长限制（免费版 10ms CPU/请求，IO 等待不计）。
 - 中国移动云盘（yun139）凭据 `YUN139_AUTHORIZATION` 内嵌 token 有效期：剩余 <15 天自动
   刷新；token 已过期或刷新失败时需重新获取并更新该 Secret。驱动不做密码登录恢复。
+- 迅雷网盘（xunlei）`XUNLEI_REFRESH_TOKEN` 默认 30 天有效：accessToken 过期自动用
+  refreshToken 刷新；refreshToken 本身过期后无法静默续期，需重新获取并更新凭据
+  （后续将增加过期前定时任务提醒）。上传受 Workers 单请求体上限约束（>100MB 建议外部工具）。
 - KV 免费额度有限：锁与索引条目极小（< 1KB），勿用于存储大对象。
 - Google Drive / Dropbox 目录层次较深时路径解析涉及多次 API 调用，深度建议 ≤ 20 层。
 - WebDAV 为"尽力兼容"实现：Windows 资源管理器 / macOS Finder / rclone / Cyberduck /
