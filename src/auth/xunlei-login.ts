@@ -307,7 +307,7 @@ class XunleiCommon {
     const metas: Record<string, string> = {};
     if (/^\w+([-+.]\w+)*@\w+([-.]\w+)*\.\w+([-.]\w+)*$/.test(username)) {
       metas.email = username;
-    } else if (username.length >= 11 && username.length <= 18) {
+    } else if (/^1\d{10}$/.test(username)) {
       metas.phone_number = username;
     } else {
       metas.username = username;
