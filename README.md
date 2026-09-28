@@ -1,3 +1,25 @@
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 932475866bc48bd2f98012d270878988_655541fbbafb11f1a1bf52540064ee0f
+    ReservedCode1: h6lrwFfA8TvNeY+d+fRrdGD2tUuxi1d59gzPOxg2FQqa49QSmLSJZz+Nl9VfOnHJUlP1xP2QA2uib8rUhPp1XfNZs5FCkIW3to6Mlz8pwANYcR8kq9bGlullRxXQl84i+RAnI0wxfH31fsj3bQwGanc/CtFphX/S1qm9S9dSzvGYi7BsKmid3JugUTM=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 932475866bc48bd2f98012d270878988_655541fbbafb11f1a1bf52540064ee0f
+    ReservedCode2: h6lrwFfA8TvNeY+d+fRrdGD2tUuxi1d59gzPOxg2FQqa49QSmLSJZz+Nl9VfOnHJUlP1xP2QA2uib8rUhPp1XfNZs5FCkIW3to6Mlz8pwANYcR8kq9bGlullRxXQl84i+RAnI0wxfH31fsj3bQwGanc/CtFphX/S1qm9S9dSzvGYi7BsKmid3JugUTM=
+---
+
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 932475866bc48bd2f98012d270878988_6b34873bbaf811f19ba1525400638852
+    ReservedCode1: o1mgrlLMcC1w1BPisWff/bXHDMdfqyP2qcroZmfeP2dP2ENf3gbN7rlC6eZtkADQSb3Uhzf5iaS4rfwXDSYx1No5Hg5v57kvdn3/85aVqYDVEWC3yaPFIc6YFpDcqVDmElepnuh/h46Lmh3HmJERS2gMlQQByY67HzZ99dqZ9bBInJS4KoxukpqERLQ=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 932475866bc48bd2f98012d270878988_6b34873bbaf811f19ba1525400638852
+    ReservedCode2: o1mgrlLMcC1w1BPisWff/bXHDMdfqyP2qcroZmfeP2dP2ENf3gbN7rlC6eZtkADQSb3Uhzf5iaS4rfwXDSYx1No5Hg5v57kvdn3/85aVqYDVEWC3yaPFIc6YFpDcqVDmElepnuh/h46Lmh3HmJERS2gMlQQByY67HzZ99dqZ9bBInJS4KoxukpqERLQ=
+---
+
 # WebDAV Cloud Drive
 
 基于 **Cloudflare Workers** 的 WebDAV 云盘服务：一个可直接部署的 WebDAV 服务器 + 浏览器
@@ -35,6 +57,9 @@ Web UI，可挂载到 Windows 资源管理器 / macOS Finder / rclone / Cyberduc
   耗时 / 存储后端，支持过滤分页）。
 - **D1 持久化请求日志**：`GET /api/logs` 分页查询；写入走 `waitUntil` 异步，不阻塞响应。
 - **KV 存储**：WebDAV 锁状态（`DAV_LOCKS`）与 Telegram 索引（`TELEGRAM_INDEX`）。
+- **自动登录获取凭据**：`POST /api/auth/<driver>/login` 统一登录服务（`AUTH_PROVIDERS` 注册表，
+  当前支持 `xunlei`），Web UI 配置卡片「自动登录获取凭据」一键登录迅雷并自动回填
+  `refreshToken`，保存即生效；密码仅经请求体传递，不落库、不回显。
 
 ## 技术栈
 
@@ -64,6 +89,10 @@ webdav-cloud-drive/
     ├── index.ts                   # 入口：路由分发 + Basic Auth + 日志埋点 + 虚拟根分区
     ├── config.ts                  # 配置管理（六驱动 + LogConfig，Secret 零硬编码）
     ├── auth.ts                    # HTTP Basic Auth 校验
+    ├── auth/                      # 自动登录获取凭据服务（/api/auth/<driver>/…）
+    │   ├── types.ts               # AuthProvider 接口与请求/响应契约
+    │   ├── xunlei-login.ts        # 迅雷自动登录（xluser-ssl.v1 协议移植）
+    │   └── index.ts               # AUTH_PROVIDERS 注册表 + 路由解析分发
     ├── types.ts                   # DavContext / DavError 等公共类型
     ├── locks.ts                   # WebDAV LOCK/UNLOCK 的 KV 锁管理
     ├── log/d1logger.ts            # D1 日志封装（log / query 分页）
@@ -140,7 +169,7 @@ npx wrangler deploy
 | `gdrive` | `GDRIVE_CLIENT_ID` / `GDRIVE_CLIENT_SECRET` / `GDRIVE_REFRESH_TOKEN` | `GDRIVE_ROOT_ID` |
 | `dropbox` | `DROPBOX_ACCESS_TOKEN`（或 `DROPBOX_REFRESH_TOKEN` + `DROPBOX_APP_KEY` + `DROPBOX_APP_SECRET`） | — |
 | `yun139` | `YUN139_AUTHORIZATION`（base64("pc:\<账号\>:\<token\|...\|exp\>")） | — |
-| `xunlei` | `XUNLEI_REFRESH_TOKEN` | `XUNLEI_ACCESS_TOKEN`（可选缓存，缺失自动刷新） |
+| `xunlei` | `XUNLEI_REFRESH_TOKEN`（可用 UI「自动登录获取凭据」一键获取回填） | `XUNLEI_ACCESS_TOKEN`（可选缓存，缺失自动刷新） |
 
 **Google Drive refresh_token 获取**（一次性）：
 
@@ -175,8 +204,9 @@ npx wrangler deploy
 - 中国移动云盘（yun139）凭据 `YUN139_AUTHORIZATION` 内嵌 token 有效期：剩余 <15 天自动
   刷新；token 已过期或刷新失败时需重新获取并更新该 Secret。驱动不做密码登录恢复。
 - 迅雷网盘（xunlei）`XUNLEI_REFRESH_TOKEN` 默认 30 天有效：accessToken 过期自动用
-  refreshToken 刷新；refreshToken 本身过期后无法静默续期，需重新获取并更新凭据
-  （后续将增加过期前定时任务提醒）。上传受 Workers 单请求体上限约束（>100MB 建议外部工具）。
+  refreshToken 刷新；refreshToken 本身过期后无法静默续期，可在「存储配置」页 xunlei
+  卡片点「自动登录获取凭据」重新登录回填（见 docs/usage.md「5.2」）。上传受 Workers
+  单请求体上限约束（>100MB 建议外部工具）。
 - KV 免费额度有限：锁与索引条目极小（< 1KB），勿用于存储大对象。
 - Google Drive / Dropbox 目录层次较深时路径解析涉及多次 API 调用，深度建议 ≤ 20 层。
 - WebDAV 为"尽力兼容"实现：Windows 资源管理器 / macOS Finder / rclone / Cyberduck /
@@ -185,3 +215,5 @@ npx wrangler deploy
 ## License
 
 MIT
+*（内容由AI生成，仅供参考）*
+*（内容由AI生成，仅供参考）*

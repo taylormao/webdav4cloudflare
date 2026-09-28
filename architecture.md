@@ -1,3 +1,25 @@
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 932475866bc48bd2f98012d270878988_6473e442bafb11f1a1bf52540064ee0f
+    ReservedCode1: THB+4i/cSvucRSNszPY3D9Edy1wgB4R4IYRNLOBV3S59BbgeqjSDsvboNvNCF/dyE9Xg+UK+blmDD9RVTRJG5pYvcKdcEwVwTa+1RknVq14cXA8Gt+RG49IBROPdbrUxrDby8ZrtYiLiNfbIT+DLHj478DYjReqCXaOkKxa421OLZusWi7d6lOi8pzU=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 932475866bc48bd2f98012d270878988_6473e442bafb11f1a1bf52540064ee0f
+    ReservedCode2: THB+4i/cSvucRSNszPY3D9Edy1wgB4R4IYRNLOBV3S59BbgeqjSDsvboNvNCF/dyE9Xg+UK+blmDD9RVTRJG5pYvcKdcEwVwTa+1RknVq14cXA8Gt+RG49IBROPdbrUxrDby8ZrtYiLiNfbIT+DLHj478DYjReqCXaOkKxa421OLZusWi7d6lOi8pzU=
+---
+
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 932475866bc48bd2f98012d270878988_6a5082fcbaf811f19ba1525400638852
+    ReservedCode1: 96rjMD6zdXRAO7lHjXeQHAvEXhOc9b22vpWcB0tSOIpiWBnugOuxWCKL06o4wCIh8M0iXvbb9hTmLu88e3vmJ0ZZ9ax0pLZ4zXjME/GPa4jtBDZMFdiWGK2vN8a/Zg4GlxTcp/slnh8/HaDseNEi7Yk7YnYyBYhV8oUty/sVGb4gMI+nbHKvrMSeddM=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 932475866bc48bd2f98012d270878988_6a5082fcbaf811f19ba1525400638852
+    ReservedCode2: 96rjMD6zdXRAO7lHjXeQHAvEXhOc9b22vpWcB0tSOIpiWBnugOuxWCKL06o4wCIh8M0iXvbb9hTmLu88e3vmJ0ZZ9ax0pLZ4zXjME/GPa4jtBDZMFdiWGK2vN8a/Zg4GlxTcp/slnh8/HaDseNEi7Yk7YnYyBYhV8oUty/sVGb4gMI+nbHKvrMSeddM=
+---
+
 # WebDAV Cloud Drive — 架构设计与项目结构规划
 
 ## 1. 总体架构
@@ -260,6 +282,46 @@ buildConfig(env, kv?)  [async]
 - `/api/config` 响应只含 `set: boolean` 与字段元数据，**不回显明文**；敏感值仅经鉴权后的表单提交写入 KV（KV 值本身为密文存储，仅 Worker 可读）。
 - `.dev.vars.example` 补充 KV 占位说明；`wrangler.toml` 注释写明 `kv namespace create` 步骤。
 
+## 11. 自动登录获取凭据服务（本迭代新增）
+
+### 11.1 目标
+
+外挂存储（如迅雷）配置字段多、凭据获取门槛高，用户往往需要自行抓包或借助第三方工具。本服务让系统**代替用户完成第三方登录**：前端弹窗输入账号密码，后端按各驱动协议登录，成功后把 `refreshToken` 等配置字段**自动回填**到配置表单，用户只需点击「保存配置」即可生效。
+
+### 11.2 统一框架：/api/auth/<driver>/<action>（AUTH_PROVIDERS 注册表）
+
+- 路由前缀 `/api/auth/<driver>/<action>`，位于 `/api/*` 分支内，统一走 `requireAuth`（DAV_USER/DAV_PASS Basic 鉴权），未通过一律 401。
+- `src/auth/index.ts` 以 `AUTH_PROVIDERS` 注册表组织各驱动登录实现：`parseAuthPath` 解析 `/api/auth/<driver>/<action>`，`handleAuthApi` 分发到注册表实现；当前仅 `action=login`。
+- 后续新增驱动只需实现 `AuthProvider`（`src/auth/types.ts` 接口：`driver` + `login(params)`）并注册进 `AUTH_PROVIDERS`，入口零改动。
+- 请求/响应契约：
+  - `POST /api/auth/<driver>/login`，body = JSON 对象（如 `{ username, password, safePassword? }`）；
+  - 成功：`{ ok: true, fields: { refreshToken, accessToken?, accessTokenExpiresAt?, deviceId?, userAgent? }, message }`；
+  - 失败：`{ ok: false, error, kind }`，`kind` ∈ `invalid`(400，入参/凭据错误) / `verify`(409，需人工处理验证码或风控) / `upstream`(502，上游异常)。
+
+### 11.3 迅雷自动登录（POST /api/auth/xunlei/login）
+
+`src/auth/xunlei-login.ts` 移植 AList `thunder_browser` 驱动（`util.go` / `driver.go` / `meta.go`）的 `xluser-ssl.xunlei.com/v1` 登录协议：
+
+- **内置 client 凭据**：`client_id=ZUBzD9J_XPXfn7f7`、`client_secret=yESVmHecEe6F0aou69vl-g`、`client_version=1.10.0.2633`、`package_name=com.xunlei.browser`（与 `xunlei.ts` 常量对齐，代码内硬编码，不落库）。
+- **设备 ID 派生**：`device_id = md5hex(username + password)`（与 AList Login 模式一致）。
+- **captcha_token 获取**：登录前 `POST /v1/shield/captcha/init`，按 username 形态填 `email` / `phone_number` / `username` meta；请求附带 `captcha_sign`（内置 `Algorithms` 逐段 MD5 链签名 + 毫秒时间戳）；响应含 `url` 时判定为需人工验证（409 verify），空 `captcha_token` 视为上游异常（502）。
+- **登录**：`POST /v1/auth/signin`，body 携带 `captcha_token / client_id / client_secret / username / password`；响应 `error_code=9 & captcha_invalid` 时**重新获取 captcha_token 并重试一次**（第二次失败直接报错）。
+- **成功回填**：`refreshToken`（必填）+ `accessToken` / `accessTokenExpiresAt`（登录响应含 `expires_in` 时按当前时间换算秒级时间戳）+ `deviceId` / `userAgent`（均为 xunlei 配置 schema 已有字段，可一并回填）。
+- **safePassword（可选）**：入参接受但本阶段不参与业务（AList 中用于超级保险箱 space token，xunlei schema 无对应存储位），文档注明。
+
+### 11.4 前端：配置卡片「自动登录获取凭据」
+
+- xunlei 配置卡片（`app.js` `renderDriverFormCard`）新增按钮「自动登录获取凭据」。
+- 点击弹出模态框（复用 `.modal-overlay` 样式）：账号（必填）/ 密码（必填）/ 安全密码（可选）。
+- 提交后 `POST /api/auth/xunlei/login`（携带 Basic 凭据与 JSON body）；成功后把 `fields` 逐项回填到表单对应 `data-field` 输入框，`refreshToken` 输入框短暂高亮（`.auth-filled`），卡片消息提示「已获取，请保存」；失败在弹窗内展示错误（`kind=verify` 时提示需人工处理验证）。
+- 新增 UI 样式：`.config-msg.ok-flash`（成功高亮消息）、`.auth-filled`（输入框绿色描边）。
+
+### 11.5 安全约束
+
+- 登录密码仅存在于**请求体内**：不落库、不写日志（D1 日志只记方法/路径/状态码）、不回显。
+- 响应只回传可回填配置的凭据字段（`refreshToken` / `accessToken` 等），**绝不回传密码**或任何未要求的中间值。
+- 前端弹窗密码框 `autocomplete=current-password`，关闭/成功即移除 DOM，密码不写入 sessionStorage。
+
 ## 6. 多存储虚拟根分区与在线预览（本迭代升级）
 
 ### 6.1 多驱动装配（A）
@@ -312,7 +374,7 @@ buildConfig(env, kv?)  [async]
 
 ### 6.5.4 已知限制
 
-- **token 过期需人工刷新**：当前实现仅在访问时发现凭据失效返回明确错误；`refreshToken` 本身过期后无法静默续期，需用户重新获取并更新凭据（后续迭代将增加 token 过期前定时任务提醒）。
+- **token 过期需人工刷新**：当前实现仅在访问时发现凭据失效返回明确错误；`refreshToken` 本身过期后无法静默续期，可通过「存储配置」页 xunlei 卡片的**自动登录获取凭据**（见 §11）重新获取并保存。
 - **Workers 请求体限制**：上传受 Cloudflare Workers 单请求体上限约束，超 100MB 文件在浏览器端需依赖分片/外部工具；下载不受影响（流式）。
 - **captcha 签名依赖客户端固定密钥**：签名仅用于满足 API 的 `X-Captcha-Token` 校验，不保证长期有效；若迅雷收紧校验，需更新签名算法或切换开放平台方案（`alist_thunder`）。
 - 未实现：分享/离线下载/秒传等迅雷特有能力，仅覆盖 WebDAV 基本文件语义。
@@ -353,3 +415,5 @@ Workers 运行时位于 Cloudflare 全球边缘网络，**服务端发出的所�
 - 静态资源：`[assets] directory = ./public`，由 Workers 直接托管。
 - 密钥：`dav_user` / `dav_pass` / 各存储凭据均以 `wrangler secret put` 注入。
 - 自定义域名：Cloudflare 控制台绑定，启用后即为 WebDAV 服务地址。
+*（内容由AI生成，仅供参考）*
+*（内容由AI生成，仅供参考）*

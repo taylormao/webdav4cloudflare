@@ -165,6 +165,7 @@ const DRIVER_BADGES = {
   telegram: { label: 'Telegram', icon: '✈️' },
   baidu: { label: '百度网盘', icon: '📀' },
   yun139: { label: '中国移动云盘', icon: '📶' },
+  xunlei: { label: '迅雷云盘', icon: '⚡' },
 };
 
 const PROPFIND_BODY = `<?xml version="1.0" encoding="utf-8"?>
@@ -748,6 +749,7 @@ const DRIVER_NAMES = {
   gdrive: 'Google Drive',
   dropbox: 'Dropbox',
   yun139: '中国移动云盘',
+  xunlei: '迅雷云盘',
 };
 
 const DRIVER_DESCS = {
@@ -757,6 +759,7 @@ const DRIVER_DESCS = {
   gdrive: 'Google Drive；需要 clientId / clientSecret / refreshToken。',
   dropbox: 'Dropbox；accessToken 与 refreshToken + appKey + appSecret 二选一。',
   yun139: '中国移动云盘（139 / 和彩云）；authorization = base64("pc:<账号>:<token|...|exp>")。',
+  xunlei: '迅雷云盘；必填仅 refreshToken，可用「自动登录获取凭据」一键获取并回填。',
 };
 
 async function loadSettings() {
@@ -855,6 +858,17 @@ function renderDriverFormCard(key, meta) {
   btnSave.textContent = '保存配置';
   actions.appendChild(btnSave);
 
+  // 自动登录获取凭据：xunlei 支持（弹窗表单 → /api/auth/<driver>/login → 回填 refreshToken）
+  let btnAuth = null;
+  if (key === 'xunlei') {
+    btnAuth = document.createElement('button');
+    btnAuth.type = 'button';
+    btnAuth.className = 'btn';
+    btnAuth.textContent = '自动登录获取凭据';
+    btnAuth.title = '使用迅雷账号密码自动登录，获取 refreshToken 并回填表单；回填后请点击「保存配置」生效';
+    actions.appendChild(btnAuth);
+  }
+
   const btnClear = document.createElement('button');
   btnClear.type = 'button';
   btnClear.className = 'btn btn-danger';
@@ -876,6 +890,11 @@ function renderDriverFormCard(key, meta) {
   const flashDirty = () => {
     window.__configDirty = true;
   };
+
+  // 自动登录弹窗
+  if (btnAuth) {
+    btnAuth.addEventListener('click', () => openAuthModal(key, form, msg, flashDirty));
+  }
 
   // 保存：收集非空字段，PUT /api/config?type=<key>
   form.addEventListener('submit', async (e) => {
@@ -931,6 +950,108 @@ function renderDriverFormCard(key, meta) {
   });
 
   return card;
+}
+
+/**
+ * 自动登录获取凭据弹窗：账号/密码（+ 可选安全密码）→ POST /api/auth/<driver>/login
+ * 成功后回填表单对应字段（refreshToken 等）并高亮提示「已获取，请保存」。
+ * 密码仅经请求体传递，不落库、不回显。
+ */
+function openAuthModal(driver, form, msg, flashDirty) {
+  const existing = document.getElementById('authModalOverlay');
+  if (existing) existing.remove();
+
+  const names = { xunlei: '迅雷云盘' };
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.id = 'authModalOverlay';
+  overlay.innerHTML = `
+    <div class="modal">
+      <h2>${escapeHtml(names[driver] || driver)} 自动登录</h2>
+      <p class="hint">使用账号密码自动登录并获取凭据；密码仅本次请求使用，不保存、不回显。</p>
+      <form id="authModalForm">
+        <label>账号<input type="text" id="authUser" autocomplete="username" required /></label>
+        <label>密码<input type="password" id="authPass" autocomplete="current-password" required /></label>
+        <label>安全密码（可选）<input type="password" id="authSafePass" autocomplete="off" placeholder="超级保险箱密码，可留空" /></label>
+        <p class="config-msg" id="authModalMsg"></p>
+        <div class="config-actions">
+          <button type="submit" class="btn btn-primary" id="authModalOk">登录并获取</button>
+          <button type="button" class="btn" id="authModalCancel">取消</button>
+        </div>
+      </form>
+    </div>`;
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) overlay.remove();
+  });
+  document.body.appendChild(overlay);
+
+  const f = overlay.querySelector('#authModalForm');
+  const m = overlay.querySelector('#authModalMsg');
+  const ok = overlay.querySelector('#authModalOk');
+
+  f.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const username = overlay.querySelector('#authUser').value.trim();
+    const password = overlay.querySelector('#authPass').value;
+    const safePassword = overlay.querySelector('#authSafePass').value;
+    if (!username || !password) {
+      m.textContent = '请输入账号与密码';
+      m.className = 'config-msg err';
+      return;
+    }
+    ok.disabled = true;
+    m.textContent = '登录中…';
+    m.className = 'config-msg';
+    try {
+      const data = await fetchJson(`/api/auth/${encodeURIComponent(driver)}/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password, safePassword }),
+      });
+      if (!data.ok) throw new Error(data.error || '登录失败');
+      // 回填可回填字段（refreshToken 等）
+      let filled = 0;
+      for (const [name, value] of Object.entries(data.fields || {})) {
+        const el = form.querySelector(`[data-field="${name}"]`);
+        if (el) {
+          el.value = String(value);
+          filled++;
+        }
+      }
+      overlay.remove();
+      const rt = form.querySelector('[data-field="refreshToken"]');
+      if (filled > 0) {
+        if (rt) {
+          rt.classList.add('auth-filled');
+          setTimeout(() => rt.classList.remove('auth-filled'), 4000);
+        }
+        msg.textContent = data.message || '已获取，请保存';
+        msg.className = 'config-msg ok-flash';
+        setTimeout(() => { msg.className = 'config-msg'; }, 5000);
+        flashDirty();
+      } else {
+        msg.textContent = '登录成功，但表单中没有可回填字段，请手动填写';
+        msg.className = 'config-msg err';
+      }
+    } catch (err) {
+      let text = err.message || '登录失败';
+      // fetchJson 失败信息形如 "409 {...json...}"，尝试提取服务端 error/kind
+      const m2 = /(\{.*\})/.exec(text);
+      if (m2) {
+        try {
+          const j = JSON.parse(m2[1]);
+          text = j.error || text;
+          if (j.kind === 'verify') text = '需要人工处理验证：' + text;
+        } catch (_) {}
+      }
+      m.textContent = text;
+      m.className = 'config-msg err';
+      ok.disabled = false;
+    }
+  });
+
+  overlay.querySelector('#authModalCancel').addEventListener('click', () => overlay.remove());
+  overlay.querySelector('#authUser').focus();
 }
 
 function renderSettings(box, s, cfg) {

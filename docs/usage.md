@@ -1,3 +1,25 @@
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 932475866bc48bd2f98012d270878988_6612ca15bafb11f1a1bf52540064ee0f
+    ReservedCode1: J7Rd0LT2hBnxidndjHBlbgjuOKMpdUr7YFgfsgCnxO+psK0W3p+DnadIj038swRmGRNYGdDLjcGb4BtKFc+z7Nn7RUwJTgRt9OoBNQyCOS+gSEKA2s7qevYqcjgc732/BguEoTSe/LrzEg7+zay4LX+D0W7tBC9l8QoYhEzg8/Sd2m8sWHekSaBp1qM=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 932475866bc48bd2f98012d270878988_6612ca15bafb11f1a1bf52540064ee0f
+    ReservedCode2: J7Rd0LT2hBnxidndjHBlbgjuOKMpdUr7YFgfsgCnxO+psK0W3p+DnadIj038swRmGRNYGdDLjcGb4BtKFc+z7Nn7RUwJTgRt9OoBNQyCOS+gSEKA2s7qevYqcjgc732/BguEoTSe/LrzEg7+zay4LX+D0W7tBC9l8QoYhEzg8/Sd2m8sWHekSaBp1qM=
+---
+
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 932475866bc48bd2f98012d270878988_6be703cbbaf811f1a1bf52540064ee0f
+    ReservedCode1: XNJQgCPDIzk1fsXJkUO/LgtyInTsiN8ASnZTkiuOGQmO2nOVoyCL5oGsEgRqiQwlnIhc/5F8rC2KEMcKsxypw0xIquDCKIPlozhXHGk9fAwjUIVLqVpW7y3qTKA1iWWoTNt4O26/wvsz3m/4dfX81leul3k1QD1g1OvywfvMc6m33VPKN6Ezbwro1cs=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 932475866bc48bd2f98012d270878988_6be703cbbaf811f1a1bf52540064ee0f
+    ReservedCode2: XNJQgCPDIzk1fsXJkUO/LgtyInTsiN8ASnZTkiuOGQmO2nOVoyCL5oGsEgRqiQwlnIhc/5F8rC2KEMcKsxypw0xIquDCKIPlozhXHGk9fAwjUIVLqVpW7y3qTKA1iWWoTNt4O26/wvsz3m/4dfX81leul3k1QD1g1OvywfvMc6m33VPKN6Ezbwro1cs=
+---
+
 # 使用说明（Usage）
 
 本文档说明部署完成后如何通过 WebDAV 客户端与浏览器 UI 使用本服务。
@@ -36,7 +58,7 @@
 | `/baidu/` | 百度网盘 | 受 Workers 请求体上限（100MB）约束 |
 | `/dropbox/` | Dropbox | 受 Workers 请求体上限（100MB）约束 |
 | `/yun139/` | 中国移动云盘（139 / 和彩云） | 受 Workers 请求体上限（100MB）约束；凭据过期需手动更新 |
-| `/xunlei/` | 迅雷网盘 | 受 Workers 请求体上限（100MB）约束；refreshToken 默认 30 天有效，过期需手动更新 |
+| `/xunlei/` | 迅雷网盘 | 受 Workers 请求体上限（100MB）约束；refreshToken 默认 30 天有效，过期可在「存储配置」页一键自动登录重新获取（见 §5.2） |
 
 - 根路径（`/`）列出所有已装配分区；`PROPFIND /` 会返回各分区目录。
 - 只配置了单一驱动时，兼容不带分区前缀的根路径直接映射（例如只配了 gdrive，
@@ -115,6 +137,24 @@ Cyberduck / RaiDrive / rclone。
 
 进入某个服务分区后，顶部常驻显示该服务名称徽标（如 `gdrive`、`telegram`），便于确认当前所在后端。
 
+### 5.2 自动登录获取凭据（迅雷）
+
+xunlei 配置卡片上有「自动登录获取凭据」按钮，代替手动抓包获取 `refreshToken`：
+
+1. 进入「存储配置」页，找到 **迅雷云盘** 卡片，点击 **自动登录获取凭据**；
+2. 弹窗中填写迅雷**账号**与**密码**（安全密码可选，可留空），点击「登录并获取」；
+3. 登录成功后，`refreshToken`（及可用的 `accessToken` / 过期时间 / `deviceId` /
+   `userAgent`）自动回填到表单，`refreshToken` 输入框短暂高亮，卡片提示「已获取，请保存」；
+4. 点击「保存配置」即生效（服务端按 KV 持久化，凭据加密存储、永不回显）。
+
+说明与安全：
+
+- 该功能调用 `POST /api/auth/xunlei/login`（复用 DAV_USER/DAV_PASS 鉴权），
+  后端按迅雷 `xluser-ssl.xunlei.com/v1` 登录协议完成登录并返回 `refreshToken`；
+- 密码仅存在于本次请求体内：不落库、不写日志、不回显，前端弹窗关闭即销毁；
+- 若迅雷要求滑块 / 短信验证（返回"需人工处理验证"），需在浏览器中完成验证后重试；
+- `refreshToken` 默认 30 天有效，过期后重新走上述流程即可。
+
 ## 6. 在线预览与下载
 
 WebDAV 之外，服务提供两个管理 API（均需 Basic Auth，路径带分区前缀）：
@@ -132,3 +172,5 @@ WebDAV 之外，服务提供两个管理 API（均需 Basic Auth，路径带分�
   Workers 请求体上限（100MB）约束，建议 ≤ 50MB 稳妥；大文件请使用 `/gdrive/` 或 `/s3/`。
 - **Telegram 分区看不到刚发送的文件**：同步在 list/stat 时触发，刷新目录即可；
   `>20MB` 的消息不会被同步。
+*（内容由AI生成，仅供参考）*
+*（内容由AI生成，仅供参考）*

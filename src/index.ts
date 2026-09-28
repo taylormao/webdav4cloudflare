@@ -29,6 +29,7 @@ import {
 } from './kv-config';
 import { createDrivers, type DriverEnv } from './storage/registry';
 import { requireAuth, requireAuthFlexible } from './auth';
+import { handleAuthApi, parseAuthPath } from './auth/index';
 import { normalizePath, baseName } from './utils/path';
 import { dispatch } from './webdav/router';
 import { buildOptionsResponse } from './webdav/options';
@@ -82,6 +83,13 @@ app.all('*', async (c) => {
     const drivers = createDrivers(config, c.env);
     try {
       let res: Response;
+      // 自动登录获取凭据服务：/api/auth/<driver>/<action>（登录框架，AUTH_PROVIDERS 注册表）
+      const authRoute = parseAuthPath(rawPath);
+      if (authRoute) {
+        res = await handleAuthApi(c, authRoute);
+        finishLog(c, logger, { method, path: rawPath, status: res.status, durationMs: Date.now() - start, storage: config.storageType });
+        return res;
+      }
       switch (rawPath) {
         case '/api/logs': {
           const limit = clampInt(url.searchParams.get('limit'), 100, 1, 500);

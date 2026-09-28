@@ -1,3 +1,14 @@
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 932475866bc48bd2f98012d270878988_6c8ad45cbaf811f1a1bf52540064ee0f
+    ReservedCode1: +PRZt4QQJd8s7y+VbabIBj8OdG2hbdJcinTkkYzh/Ko5qs6Tp+xRmNh90Buh819tPweyIaMgEgklOnOwrDuRk7npfbckERG2GwlMTVFwM6qO8V17S5+d0cN8fYpKNzmeVrS16gYyK8fIvcnWhCdn6PLEUi8/aHpefBf8yrYd4Nhxx59+NLdU1kyn4ao=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 932475866bc48bd2f98012d270878988_6c8ad45cbaf811f1a1bf52540064ee0f
+    ReservedCode2: +PRZt4QQJd8s7y+VbabIBj8OdG2hbdJcinTkkYzh/Ko5qs6Tp+xRmNh90Buh819tPweyIaMgEgklOnOwrDuRk7npfbckERG2GwlMTVFwM6qO8V17S5+d0cN8fYpKNzmeVrS16gYyK8fIvcnWhCdn6PLEUi8/aHpefBf8yrYd4Nhxx59+NLdU1kyn4ao=
+---
+
 # 部署说明（Deployment）
 
 本文档说明如何从零部署 webdav-cloud-drive 到 Cloudflare Workers，并绑定自定义域名。
@@ -184,3 +195,4 @@ gh secret set CLOUDFLARE_ACCOUNT_ID
 - [ ] WebDAV 根路径 `PROPFIND` 返回已装配分区（如 `/gdrive/`、`/telegram/`）；
 - [ ] 向配置的 Telegram chat 发送一个文件，刷新 `/telegram/` 可见自动同步；
 - [ ] `/api/logs` 能查询到请求日志（需开启 `LOG_ENABLED`）。
+*（内容由AI生成，仅供参考）*
