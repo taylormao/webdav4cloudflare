@@ -1,14 +1,18 @@
 /**
- * 迅雷（thunder_browser 方案）自动登录提供者
+ * 迅雷（thunder 方案 v3 流程）自动登录提供者
  *
- * 移植自 AList thunder_browser 驱动（util.go / driver.go / meta.go）：
- *   - 内置 client 凭据：com.xunlei.browser 客户端（ClientID/ClientSecret/ClientVersion/PackageName）
- *   - 设备 ID 派生：md5hex(username + password)（与 AList Login 模式一致）
- *   - 登录流程：先 POST /v1/shield/captcha/init 获取 captcha_token（按 username 形态填
- *     email/phone_number/username meta），再 POST /v1/auth/signin 完成登录；
- *     signin 遇 error_code=9 & captcha_invalid 时重新获取 captcha_token 并重试一次
- *   - 验证码签名：内置 Algorithms 逐段 MD5 链（GetCaptchaSign，timestamp=Unix 毫秒）
- *   - 登录成功返回 refresh_token（含 access_token / expires_in），可回填 xunlei 配置
+ * 移植自 AList thunder 驱动（util.go / driver.go / meta.go / types.go，PR #8342 之后主流程）：
+ *   - 内置 client 凭据：com.xunlei.downloadprovider 客户端 8.31.0.9726
+ *     （ClientID=Xp6vsxz_7IYVw2BB / ClientSecret=Xp6vsy4tN9toTVdMSpomVdXpRmES）
+ *   - 设备 ID 派生：md5hex(username + password)（与 AList Addition.GetIdentity 一致）
+ *   - 登录流程：
+ *       1) POST /xluser.core.login/v3/login 获取 sessionID（带 devicesign，可选 creditkey 信任密钥）
+ *       2) POST /v1/shield/captcha/init 获取 captcha_token（按 username 形态填
+ *          email/phone_number/username meta，RedirectUri=xlaccsdk01://xunlei.com/callback?state=harbor）
+ *       3) POST /v1/auth/signin/token 以 signin_token=sessionID 换取 access_token / refresh_token
+ *   - 风控处理：v3/login 返回 error=review_panel（或 result=review）时，解析
+ *     creditkey / reviewurl / devicesign 并以 409 verify 返回；用户完成短信验证拿到
+ *     creditkey 后，携带 creditKey 字段重试登录即可通过
  *
  * 安全：密码仅存在于本次请求体内；响应只回传可回填配置的凭据字段。
  */
@@ -16,21 +20,31 @@ import type { AuthLoginParams, AuthLoginResult, AuthProvider } from './types';
 import { AuthProviderError } from './types';
 
 // ===========================================================================
-// 常量（与 AList thunder_browser/util.go、meta.go 对齐）
+// 常量（与 AList thunder/util.go、meta.go 对齐）
 // ===========================================================================
-const XLUSER_API_URL = 'https://xluser-ssl.xunlei.com/v1';
-const SIGNIN_URL = XLUSER_API_URL + '/auth/signin';
+const XLUSER_API_BASE_URL = 'https://xluser-ssl.xunlei.com';
+const XLUSER_API_URL = XLUSER_API_BASE_URL + '/v1';
+const V3_LOGIN_URL = XLUSER_API_BASE_URL + '/xluser.core.login/v3/login';
+const SIGNIN_TOKEN_URL = XLUSER_API_URL + '/auth/signin/token';
 const CAPTCHA_INIT_URL = XLUSER_API_URL + '/shield/captcha/init';
 const REDIRECT_URI = 'xlaccsdk01://xunlei.com/callback?state=harbor';
 
-const DEFAULT_CLIENT_ID = 'ZUBzD9J_XPXfn7f7';
-const DEFAULT_CLIENT_SECRET = 'yESVmHecEe6F0aou69vl-g';
-const DEFAULT_CLIENT_VERSION = '1.10.0.2633';
-const DEFAULT_PACKAGE_NAME = 'com.xunlei.browser';
-const SDK_VERSION = '233100';
+const DEFAULT_CLIENT_ID = 'Xp6vsxz_7IYVw2BB';
+const DEFAULT_CLIENT_SECRET = 'Xp6vsy4tN9toTVdMSpomVdXpRmES';
+const DEFAULT_CLIENT_VERSION = '8.31.0.9726';
+const DEFAULT_PACKAGE_NAME = 'com.xunlei.downloadprovider';
+const DEFAULT_USER_AGENT =
+  'ANDROID-com.xunlei.downloadprovider/8.31.0.9726 netWorkType/5G appid/40 ' +
+  'deviceName/Xiaomi_M2004j7ac deviceModel/M2004J7AC OSVersion/12 protocolVersion/301 ' +
+  'platformVersion/10 sdkVersion/512000 Oauth2Client/0.9 (Linux 4_14_186-perf-gddfs8vbb238b) (JAVA 0)';
+const V3_LOGIN_USER_AGENT = 'android-ok-http-client/xl-acc-sdk/version-5.0.12.512000';
 
-/** 登录 action（与 AList GetAction("POST", signinUrl) 一致） */
-const LOGIN_ACTION = 'POST:/v1/auth/signin';
+/** devicesign 签名常量（与 AList thunder/util.go APPID/APPKey 对齐） */
+const APPID = '40';
+const APP_KEY = '34a062aaa22f906fca4fefe9fb3a3021';
+
+/** 登录 action（与 AList GetAction("POST", signinTokenUrl) 一致） */
+const LOGIN_ACTION = 'POST:/v1/auth/signin/token';
 
 // ===========================================================================
 // 类型（与 AList types.go 对齐）
@@ -48,13 +62,84 @@ interface TokenResp {
   expires_in?: number;
   sub?: string;
   user_id?: string;
-  token?: string; // 超级保险箱访问 token（本服务不回填）
 }
 
+/** v3/login 请求体（CoreLoginRequest） */
+interface CoreLoginRequest {
+  protocolVersion: string;
+  sequenceNo: string;
+  platformVersion: string;
+  isCompressed: string;
+  appid: string;
+  clientVersion: string;
+  peerID: string;
+  appName: string;
+  sdkVersion: string;
+  devicesign: string;
+  netWorkType: string;
+  providerName: string;
+  deviceModel: string;
+  deviceName: string;
+  OSVersion: string;
+  creditkey: string;
+  hl: string;
+  userName: string;
+  passWord: string;
+  verifyKey: string;
+  verifyCode: string;
+  isMd5Pwd: string;
+}
+
+/** v3/login 响应体（CoreLoginResp） */
+interface CoreLoginResp {
+  account?: string;
+  creditkey?: string;
+  expires_in?: number;
+  loginKey?: string;
+  nickName?: string;
+  secureKey?: string;
+  sessionID?: string;
+  timestamp?: string;
+  userID?: string;
+  userName?: string;
+  userNewNo?: string;
+  version?: string;
+}
+
+/** signin/token 请求体（SignInRequest） */
+interface SignInRequest {
+  client_id: string;
+  client_secret: string;
+  provider: string;
+  signin_token: string;
+}
+
+/** 风控验证响应体（LoginReviewResp） */
+interface LoginReviewResp {
+  creditkey?: string;
+  reviewurl?: string;
+  error?: string;
+  errorCode?: string;
+  errorDescription?: string;
+  errorDescUrl?: string;
+  verifyType?: string;
+  userID?: string;
+}
+
+/** 回传给用户完成验证的数据（ReviewData） */
+interface ReviewData {
+  creditkey: string;
+  reviewurl: string;
+  deviceid: string;
+  devicesign: string;
+}
+
+/** 上游错误体：兼容 error_code/error/error_description 与 result:review 两种形态 */
 interface ApiErrorBody {
   error_code?: number;
   error?: string;
   error_description?: string;
+  result?: string;
 }
 
 // ===========================================================================
@@ -134,31 +219,82 @@ function md5(input: Uint8Array): Uint8Array {
   return out;
 }
 
+/** SHA-1（用于 devicesign 签名） */
+function sha1hex(s: string): string {
+  const bytes = new TextEncoder().encode(s);
+  const ml = bytes.length * 8;
+  const padded = new Uint8Array((((bytes.length + 8) >> 6) + 1) << 6);
+  padded.set(bytes);
+  padded[bytes.length] = 0x80;
+  const dv = new DataView(padded.buffer);
+  dv.setUint32(padded.length - 4, Math.floor(ml / 4294967296), false);
+  dv.setUint32(padded.length - 8, ml >>> 0, false);
+
+  let h0 = 0x67452301;
+  let h1 = 0xefcdab89;
+  let h2 = 0x98badcfe;
+  let h3 = 0x10325476;
+  let h4 = 0xc3d2e1f0;
+  const w = new Uint32Array(80);
+
+  for (let off = 0; off < padded.length; off += 64) {
+    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4, false);
+    for (let i = 16; i < 80; i++) {
+      w[i] = ((w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]) << 1) | ((w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]) >>> 31);
+    }
+    let a = h0;
+    let b = h1;
+    let c = h2;
+    let d = h3;
+    let e = h4;
+    for (let i = 0; i < 80; i++) {
+      let f: number;
+      let k: number;
+      if (i < 20) {
+        f = (b & c) | (~b & d);
+        k = 0x5a827999;
+      } else if (i < 40) {
+        f = b ^ c ^ d;
+        k = 0x6ed9eba1;
+      } else if (i < 60) {
+        f = (b & c) | (b & d) | (c & d);
+        k = 0x8f1bbcdc;
+      } else {
+        f = b ^ c ^ d;
+        k = 0xca62c1d6;
+      }
+      const temp = ((((a << 5) | (a >>> 27)) + f + e + k + w[i]) | 0) >>> 0;
+      e = d;
+      d = c;
+      c = ((b << 30) | (b >>> 2)) >>> 0;
+      b = a;
+      a = temp;
+    }
+    h0 = (h0 + a) >>> 0;
+    h1 = (h1 + b) >>> 0;
+    h2 = (h2 + c) >>> 0;
+    h3 = (h3 + d) >>> 0;
+    h4 = (h4 + e) >>> 0;
+  }
+  const out = new Uint8Array(20);
+  const odv = new DataView(out.buffer);
+  odv.setUint32(0, h0, false);
+  odv.setUint32(4, h1, false);
+  odv.setUint32(8, h2, false);
+  odv.setUint32(12, h3, false);
+  odv.setUint32(16, h4, false);
+  return hex(out);
+}
+
 function hex(bytes: Uint8Array): string {
   return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-/** AList BuildCustomUserAgent（Android 模拟串；deviceSign 生成被 AList 注释，按原样跳过） */
-function buildCustomUserAgent(
-  deviceId: string,
-  appName: string,
-  sdkVersion: string,
-  clientVersion: string,
-  packageName: string
-): string {
-  void packageName; // 与 AList 签名保持一致（传入但未使用）
-  return (
-    `ANDROID-${appName}/${clientVersion} ` +
-    'networkType/WIFI ' +
-    'appid/22062 ' +
-    'deviceName/Xiaomi_M2004j7ac ' +
-    'deviceModel/M2004J7AC ' +
-    'OSVersion/13 ' +
-    'protocolVersion/301 ' +
-    'platformversion/10 ' +
-    `sdkVersion/${sdkVersion} ` +
-    'Oauth2Client/0.9 (Linux 4_9_337-perf-sn-uotan-gd9d488809c3d) (JAVA 0) '
-  );
+/** AList generateDeviceSign：div101.{deviceID}{md5(sha1(deviceID+packageName+APPID+APPKey))} */
+function generateDeviceSign(deviceId: string, packageName: string): string {
+  const sha1String = sha1hex(deviceId + packageName + APPID + APP_KEY);
+  const md5String = md5hex(sha1String);
+  return 'div101.' + deviceId + md5String;
 }
 
 // ===========================================================================
@@ -170,24 +306,19 @@ export class XunleiLoginProvider implements AuthProvider {
   async login(params: AuthLoginParams): Promise<AuthLoginResult> {
     const username = typeof params.username === 'string' ? params.username.trim() : '';
     const password = typeof params.password === 'string' ? params.password : '';
+    const creditKey = typeof params.creditKey === 'string' ? params.creditKey.trim() : '';
 
     if (!username || !password) {
       throw new AuthProviderError('请输入迅雷账号与密码');
     }
 
-    // 设备 ID 派生：与 AList Login 模式一致（md5hex(username + password)）
+    // 设备 ID 派生：与 AList Addition.GetIdentity 一致（md5hex(username + password)）
     const deviceId = md5hex(username + password);
     const clientId = DEFAULT_CLIENT_ID;
     const clientSecret = DEFAULT_CLIENT_SECRET;
     const clientVersion = DEFAULT_CLIENT_VERSION;
     const packageName = DEFAULT_PACKAGE_NAME;
-    const userAgent = buildCustomUserAgent(
-      deviceId,
-      packageName,
-      SDK_VERSION,
-      clientVersion,
-      packageName
-    );
+    const userAgent = DEFAULT_USER_AGENT;
 
     const common = new XunleiCommon({
       deviceId,
@@ -198,15 +329,14 @@ export class XunleiLoginProvider implements AuthProvider {
       userAgent,
     });
 
-    // 登录前先获取 captcha_token
+    // 1) v3/login 获取 sessionID（review 风控在此拦截）
+    const sessionId = await common.coreLogin(username, password, creditKey);
+
+    // 2) captcha/init 获取 captcha_token
     await common.refreshCaptchaTokenInLogin(LOGIN_ACTION, username);
 
-    // signin；遇 captcha_invalid 时重新获取 captcha_token 并重试一次（第二次失败直接抛错）
-    let token = await common.signin(username, password);
-    if (token === null) {
-      await common.refreshCaptchaTokenInLogin(LOGIN_ACTION, username);
-      token = await common.signin(username, password);
-    }
+    // 3) signin/token 以 sessionID 换取令牌
+    const token = await common.signinToken(sessionId);
 
     if (!token || !token.refresh_token) {
       throw new AuthProviderError('登录成功但未返回 refresh_token，请稍后重试', 502, 'upstream');
@@ -244,12 +374,17 @@ class XunleiCommon {
 
   constructor(private opts: XunleiCommonOptions) {}
 
-  // 基础请求（不带 Authorization，供 captcha init / signin 使用；与 AList Common.Request 对齐）
-  private async request<T = unknown>(url: string, body: unknown): Promise<T> {
+  // 基础请求（不带 Authorization，供 v3 login / captcha init / signin token 使用；与 AList Common.Request 对齐）
+  // overrideUserAgent 供 v3/login 使用（需 android-ok-http-client UA）
+  private async request<T = unknown>(
+    url: string,
+    body: unknown,
+    overrideUserAgent?: string
+  ): Promise<T> {
     const res = await fetch(url, {
       method: 'POST',
       headers: {
-        'user-agent': this.opts.userAgent,
+        'user-agent': overrideUserAgent || this.opts.userAgent,
         accept: 'application/json;charset=UTF-8',
         'x-device-id': this.opts.deviceId,
         'x-client-id': this.opts.clientId,
@@ -269,37 +404,83 @@ class XunleiCommon {
       throw new AuthProviderError(`迅雷服务响应异常（HTTP ${res.status}）`, 502, 'upstream');
     }
     const err = (json ?? {}) as ApiErrorBody;
-    if (typeof err.error_code === 'number' && err.error_code !== 0) {
+    const isError = err.error_code !== undefined && err.error_code !== 0;
+    // 风控拦截：error=review_panel（AList 判断）或 result=review（实测形态）
+    const isReview =
+      err.error === 'review_panel' ||
+      err.result === 'review' ||
+      err.error_description === 'review_panel';
+    if (isReview) {
+      throw this.buildReviewError(json as Record<string, unknown>);
+    }
+    if (isError || (err.error && err.error !== 'success')) {
       const msg = err.error_description || err.error || `error_code=${err.error_code}`;
       const e = new AuthProviderError(`迅雷返回错误：${msg}`, 502, 'upstream');
-      (e as AuthProviderError & { code?: number }).code = err.error_code;
+      if (typeof err.error_code === 'number') {
+        (e as AuthProviderError & { code?: number }).code = err.error_code;
+      }
       throw e;
     }
     return json as T;
   }
 
-  // 验证码签名：GetCaptchaSign（timestamp=UnixMilli，Algorithms 逐段 MD5 链）
-  // 仅登录后刷新（RefreshCaptchaTokenAtLogin）使用，本服务不需要，保留实现备用。
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  private getCaptchaSign(): { timestamp: string; sign: string } {
-    const timestamp = String(Date.now());
-    const algorithms = [
-      'uWRwO7gPfdPB/0NfPtfQO+71',
-      'F93x+qPluYy6jdgNpq+lwdH1ap6WOM+nfz8/V',
-      '0HbpxvpXFsBK5CoTKam',
-      'dQhzbhzFRcawnsZqRETT9AuPAJ+wTQso82mRv',
-      'SAH98AmLZLRa6DB2u68sGhyiDh15guJpXhBzI',
-      'unqfo7Z64Rie9RNHMOB',
-      '7yxUdFADp3DOBvXdz0DPuKNVT35wqa5z0DEyEvf',
-      'RBG',
-      'ThTWPG5eC0UBqlbQ+04nZAptqGCdpv9o55A',
-    ];
-    let str =
-      this.opts.clientId + this.opts.clientVersion + this.opts.packageName + this.opts.deviceId + timestamp;
-    for (const algo of algorithms) {
-      str = md5hex(str + algo);
+  // 风控验证错误：解析 creditkey/reviewurl 并构造 ReviewData（AList getReviewData）
+  private buildReviewError(body: Record<string, unknown>): AuthProviderError {
+    const review = body as unknown as LoginReviewResp;
+    const deviceSign = generateDeviceSign(this.opts.deviceId, this.opts.packageName);
+    const reviewData: ReviewData = {
+      creditkey: review.creditkey || '',
+      reviewurl: (review.reviewurl || '') + '&deviceid=' + deviceSign,
+      deviceid: deviceSign,
+      devicesign: deviceSign,
+    };
+    const jsonText = JSON.stringify(reviewData, null, 2);
+    const e = new AuthProviderError(
+      `本次登录需要短信验证（result: review）。请按以下步骤完成验证后重试：\n` +
+        `1. 在浏览器打开：${reviewData.reviewurl}\n` +
+        `2. 按页面提示完成短信验证，验证通过后从页面控制台 reviewCb 回调或页面返回结果中获取 creditkey\n` +
+        `3. 携带 creditKey 字段重新调用本登录接口（POST /api/auth/xunlei/login，body 增加 "creditKey": "..."）\n\n` +
+        `验证数据：\n${jsonText}`,
+      409,
+      'verify'
+    );
+    (e as AuthProviderError & { review?: ReviewData }).review = reviewData;
+    return e;
+  }
+
+  // v3/login：获取 sessionID（CoreLogin）
+  async coreLogin(username: string, password: string, creditKey: string): Promise<string> {
+    const deviceSign = generateDeviceSign(this.opts.deviceId, this.opts.packageName);
+    const body: CoreLoginRequest = {
+      protocolVersion: '301',
+      sequenceNo: '1000012',
+      platformVersion: '10',
+      isCompressed: '0',
+      appid: APPID,
+      clientVersion: '8.31.0.9726',
+      peerID: '00000000000000000000000000000000',
+      appName: 'ANDROID-com.xunlei.downloadprovider',
+      sdkVersion: '512000',
+      devicesign: deviceSign,
+      netWorkType: 'WIFI',
+      providerName: 'NONE',
+      deviceModel: 'M2004J7AC',
+      deviceName: 'Xiaomi_M2004j7ac',
+      OSVersion: '12',
+      creditkey: creditKey,
+      hl: 'zh-CN',
+      userName: username,
+      passWord: password,
+      verifyKey: '',
+      verifyCode: '',
+      isMd5Pwd: '0',
+    };
+    const resp = await this.request<CoreLoginResp>(V3_LOGIN_URL, body, V3_LOGIN_USER_AGENT);
+    if (!resp.sessionID) {
+      // 兼容异常返回：有 error 字段时已在 request 层抛出，这里兜底
+      throw new AuthProviderError('迅雷 v3 登录未返回 sessionID，请稍后重试', 502, 'upstream');
     }
-    return { timestamp, sign: '1.' + str };
+    return resp.sessionID;
   }
 
   // 登录时获取 captcha_token（按 username 形态填 email/phone_number/username meta）
@@ -316,9 +497,8 @@ class XunleiCommon {
   }
 
   // refreshCaptchaToken：POST /v1/shield/captcha/init
-  // 与 AList 对齐：登录时（RefreshCaptchaTokenInLogin）meta 仅含账号形态字段
-  // （email/phone_number/username）；client_version/package_name/timestamp/captcha_sign
-  // 仅用于登录后的 RefreshCaptchaTokenAtLogin（本服务无需），不得注入。
+  // 与 AList 对齐：登录时（RefreshCaptchaTokenInLogin）meta 仅含账号形态字段；
+  // client_version/package_name/timestamp/captcha_sign 仅用于登录后的刷新（本服务无需），不得注入。
   private async refreshCaptchaToken(action: string, metas: Record<string, string>): Promise<void> {
     const resp = await this.request<CaptchaTokenResponse>(CAPTCHA_INIT_URL, {
       action,
@@ -339,22 +519,14 @@ class XunleiCommon {
     this.captchaToken = resp.captcha_token;
   }
 
-  // signin：POST /v1/auth/signin
-  // 返回 null 表示验证码令牌失效（captcha_invalid），上层应重新获取 captcha_token 后重试
-  async signin(username: string, password: string): Promise<TokenResp | null> {
-    try {
-      return await this.request<TokenResp>(SIGNIN_URL, {
-        captcha_token: this.captchaToken,
-        client_id: this.opts.clientId,
-        client_secret: this.opts.clientSecret,
-        username,
-        password,
-      });
-    } catch (e) {
-      if (e instanceof AuthProviderError && (e as AuthProviderError & { code?: number }).code === 9) {
-        return null;
-      }
-      throw e;
-    }
+  // signin/token：以 v3 sessionID 换取 access_token / refresh_token
+  async signinToken(sessionId: string): Promise<TokenResp> {
+    const body: SignInRequest = {
+      client_id: this.opts.clientId,
+      client_secret: this.opts.clientSecret,
+      provider: 'access_end_point_token',
+      signin_token: sessionId,
+    };
+    return this.request<TokenResp>(SIGNIN_TOKEN_URL, body);
   }
 }
