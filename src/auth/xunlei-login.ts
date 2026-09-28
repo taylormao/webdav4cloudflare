@@ -232,8 +232,8 @@ function sha1hex(s: string): string {
   padded.set(bytes);
   padded[bytes.length] = 0x80;
   const dv = new DataView(padded.buffer);
-  dv.setUint32(padded.length - 4, Math.floor(ml / 4294967296), false);
-  dv.setUint32(padded.length - 8, ml >>> 0, false);
+  dv.setUint32(padded.length - 8, Math.floor(ml / 4294967296), false);
+  dv.setUint32(padded.length - 4, ml >>> 0, false);
 
   let h0 = 0x67452301;
   let h1 = 0xefcdab89;
