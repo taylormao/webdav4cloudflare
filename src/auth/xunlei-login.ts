@@ -29,19 +29,6 @@ const DEFAULT_CLIENT_VERSION = '1.10.0.2633';
 const DEFAULT_PACKAGE_NAME = 'com.xunlei.browser';
 const SDK_VERSION = '233100';
 
-/** 内置签名算法串（逐段 MD5 链） */
-const DEFAULT_ALGORITHMS = [
-  'uWRwO7gPfdPB/0NfPtfQO+71',
-  'F93x+qPluYy6jdgNpq+lwdH1ap6WOM+nfz8/V',
-  '0HbpxvpXFsBK5CoTKam',
-  'dQhzbhzFRcawnsZqRETT9AuPAJ+wTQso82mRv',
-  'SAH98AmLZLRa6DB2u68sGhyiDh15guJpXhBzI',
-  'unqfo7Z64Rie9RNHMOB',
-  '7yxUdFADp3DOBvXdz0DPuKNVT35wqa5z0DEyEvf',
-  'RBG',
-  'ThTWPG5eC0UBqlbQ+04nZAptqGCdpv9o55A',
-];
-
 /** 登录 action（与 AList GetAction("POST", signinUrl) 一致） */
 const LOGIN_ACTION = 'POST:/v1/auth/signin';
 
@@ -292,11 +279,24 @@ class XunleiCommon {
   }
 
   // 验证码签名：GetCaptchaSign（timestamp=UnixMilli，Algorithms 逐段 MD5 链）
+  // 仅登录后刷新（RefreshCaptchaTokenAtLogin）使用，本服务不需要，保留实现备用。
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   private getCaptchaSign(): { timestamp: string; sign: string } {
     const timestamp = String(Date.now());
+    const algorithms = [
+      'uWRwO7gPfdPB/0NfPtfQO+71',
+      'F93x+qPluYy6jdgNpq+lwdH1ap6WOM+nfz8/V',
+      '0HbpxvpXFsBK5CoTKam',
+      'dQhzbhzFRcawnsZqRETT9AuPAJ+wTQso82mRv',
+      'SAH98AmLZLRa6DB2u68sGhyiDh15guJpXhBzI',
+      'unqfo7Z64Rie9RNHMOB',
+      '7yxUdFADp3DOBvXdz0DPuKNVT35wqa5z0DEyEvf',
+      'RBG',
+      'ThTWPG5eC0UBqlbQ+04nZAptqGCdpv9o55A',
+    ];
     let str =
       this.opts.clientId + this.opts.clientVersion + this.opts.packageName + this.opts.deviceId + timestamp;
-    for (const algo of DEFAULT_ALGORITHMS) {
+    for (const algo of algorithms) {
       str = md5hex(str + algo);
     }
     return { timestamp, sign: '1.' + str };
@@ -316,13 +316,10 @@ class XunleiCommon {
   }
 
   // refreshCaptchaToken：POST /v1/shield/captcha/init
+  // 与 AList 对齐：登录时（RefreshCaptchaTokenInLogin）meta 仅含账号形态字段
+  // （email/phone_number/username）；client_version/package_name/timestamp/captcha_sign
+  // 仅用于登录后的 RefreshCaptchaTokenAtLogin（本服务无需），不得注入。
   private async refreshCaptchaToken(action: string, metas: Record<string, string>): Promise<void> {
-    const { timestamp, sign } = this.getCaptchaSign();
-    metas.client_version = this.opts.clientVersion;
-    metas.package_name = this.opts.packageName;
-    metas.timestamp = timestamp;
-    metas.captcha_sign = sign;
-
     const resp = await this.request<CaptchaTokenResponse>(CAPTCHA_INIT_URL, {
       action,
       captcha_token: this.captchaToken,
