@@ -1122,6 +1122,55 @@ function openGuangYaPanAuthModal(driver, form, msg, flashDirty) {
     return { ...body, ...extra };
   };
 
+  /** 直接读取完整响应 JSON（fetchJson 仅保留 300 字符错误体，会截断阶段一 409 的 verificationId） */
+  const postAuthJson = async (url, body) => {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { ...authHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    let json = null;
+    try {
+      json = await res.json();
+    } catch (_) {}
+    return { status: res.status, ok: res.ok, json: json || {} };
+  };
+
+  /** 登录成功：回填可配置字段并关闭弹窗 */
+  const fillAndClose = (data) => {
+    let filled = 0;
+    for (const [name, value] of Object.entries(data.fields || {})) {
+      const el = form.querySelector(`[data-field="${name}"]`);
+      if (el) {
+        el.value = String(value);
+        filled++;
+      }
+    }
+    overlay.remove();
+    if (filled > 0) {
+      const rt = form.querySelector('[data-field="refreshToken"]');
+      if (rt) {
+        rt.classList.add('auth-filled');
+        setTimeout(() => rt.classList.remove('auth-filled'), 4000);
+      }
+      msg.textContent = (data.persisted ? '凭据已落盘（KV），' : '') + (data.message || '已获取，请保存');
+      msg.className = 'config-msg ok-flash';
+      setTimeout(() => { msg.className = 'config-msg'; }, 5000);
+      flashDirty();
+    } else {
+      msg.textContent = '登录成功，但表单中没有可回填字段，请手动填写';
+      msg.className = 'config-msg err';
+    }
+  };
+
+  const showErr = (text, kind) => {
+    let t = text || '请求失败';
+    if (kind === 'verify') t = '需要人工处理验证：' + t;
+    m.textContent = t;
+    m.className = 'config-msg err';
+    ok.disabled = false;
+  };
+
   f.addEventListener('submit', async (e) => {
     e.preventDefault();
     const clientId = overlay.querySelector('#gypClientId').value.trim();
@@ -1136,75 +1185,51 @@ function openGuangYaPanAuthModal(driver, form, msg, flashDirty) {
     m.className = 'config-msg';
     try {
       if (!verificationId) {
-        // 阶段一：仅发送验证码；后端必然返回 409 verify（携带 verificationId），成功路径不会走到这里
-        await fetchJson(`/api/auth/${encodeURIComponent(driver)}/login`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(buildBody()),
-        });
-      }
-      // 阶段二：携带验证码完成登录
-      const code = codeInput.value.trim();
-      if (!verificationId || !code) {
-        m.textContent = '请先点击「发送验证码」并填写收到的短信验证码';
-        m.className = 'config-msg err';
-        ok.disabled = false;
-        return;
-      }
-      const data = await fetchJson(`/api/auth/${encodeURIComponent(driver)}/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(buildBody({ verifyCode: code, verificationId })),
-      });
-      if (!data.ok) throw new Error(data.error || '登录失败');
-      // 回填可回填字段（refreshToken / accessToken / deviceId 等）
-      let filled = 0;
-      for (const [name, value] of Object.entries(data.fields || {})) {
-        const el = form.querySelector(`[data-field="${name}"]`);
-        if (el) {
-          el.value = String(value);
-          filled++;
-        }
-      }
-      overlay.remove();
-      if (filled > 0) {
-        const rt = form.querySelector('[data-field="refreshToken"]');
-        if (rt) {
-          rt.classList.add('auth-filled');
-          setTimeout(() => rt.classList.remove('auth-filled'), 4000);
-        }
-        msg.textContent = (data.persisted ? '凭据已落盘（KV），' : '') + (data.message || '已获取，请保存');
-        msg.className = 'config-msg ok-flash';
-        setTimeout(() => { msg.className = 'config-msg'; }, 5000);
-        flashDirty();
-      } else {
-        msg.textContent = '登录成功，但表单中没有可回填字段，请手动填写';
-        msg.className = 'config-msg err';
-      }
-    } catch (err) {
-      let text = err.message || '登录失败';
-      let kind = '';
-      const m2 = /(\{.*\})/.exec(text);
-      if (m2) {
-        try {
-          const j = JSON.parse(m2[1]);
-          text = j.error || text;
-          kind = j.kind || '';
-          // 阶段一 409：收到 verificationId → 切换到待填验证码状态
-          if (j.verificationId) {
-            verificationId = String(j.verificationId);
+        // 阶段一：发送验证码；后端返回 409 verify 并携带 verificationId
+        const resp = await postAuthJson(`/api/auth/${encodeURIComponent(driver)}/login`, buildBody());
+        if (!resp.ok) {
+          if (resp.status === 409 && resp.json.verificationId) {
+            verificationId = String(resp.json.verificationId);
             codeRow.hidden = false;
             codeInput.focus();
             ok.textContent = '登录并获取';
-            m.textContent = '验证码已发送，请填写收到的短信验证码';
+            m.textContent = resp.json.error || '验证码已发送，请填写收到的短信验证码';
             m.className = 'config-msg ok-flash';
             ok.disabled = false;
             return;
           }
-        } catch (_) {}
+          showErr(resp.json.error, resp.json.kind);
+          return;
+        }
+        // 意外直接成功（后端当前阶段一必 409，兜底处理）
+        if (resp.json && resp.json.ok && resp.json.fields) {
+          fillAndClose(resp.json);
+          return;
+        }
+        m.textContent = '发送验证码异常：服务未返回 verificationId';
+        m.className = 'config-msg err';
+        ok.disabled = false;
+        return;
       }
-      if (kind === 'verify') text = '需要人工处理验证：' + text;
-      m.textContent = text;
+      // 阶段二：携带验证码完成登录
+      const code = codeInput.value.trim();
+      if (!code) {
+        m.textContent = '请填写收到的短信验证码';
+        m.className = 'config-msg err';
+        ok.disabled = false;
+        return;
+      }
+      const resp = await postAuthJson(
+        `/api/auth/${encodeURIComponent(driver)}/login`,
+        buildBody({ verifyCode: code, verificationId })
+      );
+      if (!resp.ok) {
+        showErr(resp.json.error, resp.json.kind);
+        return;
+      }
+      fillAndClose(resp.json);
+    } catch (err) {
+      m.textContent = err.message || '请求失败';
       m.className = 'config-msg err';
       ok.disabled = false;
     }
