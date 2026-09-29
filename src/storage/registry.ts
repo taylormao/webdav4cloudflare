@@ -38,7 +38,7 @@ const DRIVER_FACTORIES: ReadonlyArray<[string, DriverFactory]> = [
   ['dropbox', (cfg) => new DropboxDriver(cfg.dropbox)],
   ['yun139', (cfg) => new Yun139Driver(cfg.yun139)],
   ['xunlei', (cfg) => new XunleiDriver(cfg.xunlei)],
-  ['guangyapan', (cfg) => new GuangYaPanDriver(cfg.guangyapan)],
+  ['guangyapan', (cfg, e) => new GuangYaPanDriver(cfg.guangyapan, e.DRIVER_CONFIG)],
 ];
 
 /**

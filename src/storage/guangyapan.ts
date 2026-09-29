@@ -24,6 +24,7 @@
 import type { GuangYaPanConfig } from '../config';
 import type { FileStat, ListResult, Range, StorageDriver, WriteOptions } from './types';
 import { normalizePath, parentPath, baseName, joinPath } from '../utils/path';
+import { readKvDriverConfig } from '../kv-config';
 
 // ===========================================================================
 // 常量（与 OpenList guangyapan 对齐）
@@ -48,9 +49,6 @@ const TASK_INTERVAL_MS = 300;
 /** 上传完成轮询参数（Go: waitUploadTaskInfo maxTry=300 interval=1s） */
 const UPLOAD_MAX_TRY = 300;
 const UPLOAD_INTERVAL_MS = 1000;
-
-/** OSS 单 PUT 阈值（小文件直接单请求，减少分片开销） */
-const OSS_SINGLE_PUT_MAX = 5 * 1024 * 1024;
 
 // ===========================================================================
 // 类型（与 OpenList types.go 对齐）
@@ -165,7 +163,7 @@ export class GuangYaPanDriver implements StorageDriver {
   /** 每 endpoint 最近请求时间（Go: apiRateLimit） */
   private apiRateLimit = new Map<string, number>();
 
-  constructor(private cfg: GuangYaPanConfig) {
+  constructor(private cfg: GuangYaPanConfig, private driverConfigKv?: KVNamespace) {
     const clientId = (cfg.clientId ?? '').trim();
     if (!clientId) {
       throw new Error('GUANGYAPAN_CLIENT_ID is required for guangyapan driver');
@@ -198,6 +196,22 @@ export class GuangYaPanDriver implements StorageDriver {
     }
     this.accessToken = json.access_token;
     if (json.refresh_token) this.refreshToken = json.refresh_token;
+    await this.persistTokens();
+  }
+
+  /** 刷新成功后把新令牌字段级合并写回 DRIVER_CONFIG KV（对齐 Go MustSaveDriverStorage；尽力而为，失败不阻断） */
+  private async persistTokens(): Promise<void> {
+    const kv = this.driverConfigKv;
+    if (!kv) return;
+    try {
+      const existing = await readKvDriverConfig(kv, 'guangyapan');
+      const merged: Record<string, unknown> = { ...(existing ?? {}) };
+      merged.accessToken = this.accessToken;
+      if (this.refreshToken) merged.refreshToken = this.refreshToken;
+      await kv.put('guangyapan', JSON.stringify(merged));
+    } catch (e) {
+      console.error('[guangyapan] persist tokens to KV failed:', e);
+    }
   }
 
   /** 确保 accessToken 可用：为空时用 refreshToken 换取 */
@@ -651,11 +665,8 @@ export class GuangYaPanDriver implements StorageDriver {
     const objectUrl = `${baseUrl}/${encodedKey}`;
 
     if (bytes.byteLength === 0) {
+      // 0 字节走单 PUT；其余大小统一走 Multipart（对齐 Go guangyapan_ref/driver.go L435-439）
       await ossPutObject(objectUrl, encodedKey, new Uint8Array(0), creds);
-      return;
-    }
-    if (bytes.byteLength <= OSS_SINGLE_PUT_MAX) {
-      await ossPutObject(objectUrl, encodedKey, bytes, creds);
       return;
     }
     await ossMultipartUpload(objectUrl, encodedKey, bytes, creds);
@@ -830,8 +841,9 @@ async function ossMultipartUpload(
   for (let i = 0; i < partCount; i++) {
     const offset = i * partSize;
     const part = bytes.subarray(offset, Math.min(offset + partSize, bytes.byteLength));
+    // 请求 URL 的 query 需 URL 编码以正确传输（uploadId 可能含 +/=）；签名 resource 用原始值（OSS 服务端解码 query 后按原始值校验签名）
     const partUrl = url + `?partNumber=${i + 1}&uploadId=${encodeURIComponent(uploadId)}`;
-    const resource = `/${encodedKey}?partNumber=${i + 1}&uploadId=${encodeURIComponent(uploadId)}`;
+    const resource = `/${encodedKey}?partNumber=${i + 1}&uploadId=${uploadId}`;
     const partHeaders = ossCommonHeaders(creds, 'application/octet-stream');
     const partAuth = await ossSign(creds, 'PUT', resource, partHeaders);
     const partRes = await fetch(partUrl, {
@@ -857,7 +869,8 @@ async function ossMultipartUpload(
       .join('') +
     '</CompleteMultipartUpload>';
   const completeUrl = url + `?uploadId=${encodeURIComponent(uploadId)}`;
-  const completeResource = `/${encodedKey}?uploadId=${encodeURIComponent(uploadId)}`;
+  // 同上：签名 resource 使用原始 uploadId
+  const completeResource = `/${encodedKey}?uploadId=${uploadId}`;
   const completeHeaders = ossCommonHeaders(creds, 'application/xml');
   const completeAuth = await ossSign(creds, 'POST', completeResource, completeHeaders);
   const completeRes = await fetch(completeUrl, {

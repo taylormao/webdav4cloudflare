@@ -63,7 +63,8 @@ export function handleError(e: unknown): Response {
     });
   }
   console.error('[webdav] unhandled error:', e);
-  return new Response(buildErrorBody(undefined, 'Internal Server Error'), {
+  const message = e instanceof Error ? e.message : String(e);
+  return new Response(buildErrorBody(undefined, `Internal error: ${message}`), {
     status: 500,
     headers: { 'Content-Type': 'application/xml; charset=utf-8' },
   });
