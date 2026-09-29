@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 光鸭网盘（GuangYaPan）存储驱动
  *
  * 移植自 OpenList guangyapan 驱动（driver.go / types.go / util.go / meta.go）：
@@ -805,7 +805,7 @@ async function ossPutObject(
     body: bytes,
   });
   if (!res.ok) {
-    throw new Error(`guangyapan: oss put failed with ${res.status}`);
+    throw new Error(`guangyapan: oss put failed with ${res.status}: ${(await res.text().catch(() => '')).slice(0, 300)}`);
   }
 }
 
@@ -828,7 +828,7 @@ async function ossMultipartUpload(
     headers: { ...initHeaders, Authorization: initAuth },
   });
   if (!initRes.ok) {
-    throw new Error(`guangyapan: oss initiate multipart failed with ${initRes.status}`);
+    throw new Error(`guangyapan: oss initiate multipart failed with ${initRes.status}: ${(await initRes.text().catch(() => '')).slice(0, 300)}`);
   }
   const initXml = await initRes.text();
   const uploadId = extractXmlTag(initXml, 'UploadId');
@@ -852,7 +852,7 @@ async function ossMultipartUpload(
       body: part,
     });
     if (!partRes.ok) {
-      throw new Error(`guangyapan: oss upload part #${i + 1} failed with ${partRes.status}`);
+      throw new Error(`guangyapan: oss upload part #${i + 1} failed with ${partRes.status}: ${(await partRes.text().catch(() => '')).slice(0, 300)}`);
     }
     const etag = partRes.headers.get('etag');
     if (!etag) {
@@ -879,7 +879,7 @@ async function ossMultipartUpload(
     body: completeBody,
   });
   if (!completeRes.ok) {
-    throw new Error(`guangyapan: oss complete multipart failed with ${completeRes.status}`);
+    throw new Error(`guangyapan: oss complete multipart failed with ${completeRes.status}: ${(await completeRes.text().catch(() => '')).slice(0, 300)}`);
   }
 }
 
