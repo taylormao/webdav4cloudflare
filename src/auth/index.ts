@@ -13,6 +13,8 @@
 import type { Context } from 'hono';
 import type { AuthLoginParams } from './types';
 import { AuthProviderError } from './types';
+import { readKvDriverConfig } from '../kv-config';
+import type { StorageType } from '../config';
 import { XunleiLoginProvider } from './xunlei-login';
 import { GuangYaPanLoginProvider } from './guangyapan-login';
 
@@ -32,6 +34,24 @@ export function parseAuthPath(rawPath: string): AuthRoute | null {
   const m = /^\/api\/auth\/([^/]+)\/([^/]+)\/?$/.exec(rawPath);
   if (!m) return null;
   return { driver: m[1], action: m[2] };
+}
+
+/**
+ * 登录成功后落盘：将凭据字段合并写回 DRIVER_CONFIG KV（key=驱动类型名）。
+ * 仅更新 fields 中出现的键，保留 KV 已有其余字段（不覆盖用户已配置项）。
+ */
+async function persistLoginFields(
+  kv: KVNamespace,
+  driver: string,
+  fields: Record<string, string | number>
+): Promise<string[]> {
+  const existing = await readKvDriverConfig(kv, driver as StorageType);
+  const merged = { ...(existing ?? {}) };
+  for (const [k, v] of Object.entries(fields)) {
+    merged[k] = typeof v === 'boolean' ? v : String(v);
+  }
+  await kv.put(driver, JSON.stringify(merged));
+  return Object.keys(fields);
 }
 
 /** 处理 /api/auth/* 请求（已通过 Basic 鉴权） */
@@ -57,7 +77,18 @@ export async function handleAuthApi(c: Context, route: AuthRoute): Promise<Respo
 
   try {
     const result = await provider.login(params);
-    return c.json({ ok: true, ...result });
+    // 登录验证通过后自动落盘凭据到 KV（默认开启；persist=false 时仅返回字段不回写）
+    const persist = params.persist !== false;
+    const kv = (c.env as { DRIVER_CONFIG?: KVNamespace }).DRIVER_CONFIG;
+    let persistedFields: string[] | undefined;
+    if (persist && kv) {
+      persistedFields = await persistLoginFields(kv, route.driver, result.fields);
+    }
+    return c.json({
+      ok: true,
+      ...result,
+      ...(persistedFields ? { persisted: true, persistedFields } : {}),
+    });
   } catch (e) {
     if (e instanceof AuthProviderError) {
       return c.json(

@@ -119,6 +119,7 @@ export class GuangYaPanLoginProvider implements AuthProvider {
   async login(params: AuthLoginParams): Promise<AuthLoginResult> {
     const clientId = typeof params.clientId === 'string' ? params.clientId.trim() : '';
     const phoneRaw = typeof params.phoneNumber === 'string' ? params.phoneNumber.trim() : '';
+    const refreshToken = typeof params.refreshToken === 'string' ? params.refreshToken.trim() : '';
     const verifyCode = typeof params.verifyCode === 'string' ? params.verifyCode.trim() : '';
     const captchaToken = typeof params.captchaToken === 'string' ? params.captchaToken.trim() : '';
     const verificationId = typeof params.verificationId === 'string' ? params.verificationId.trim() : '';
@@ -129,6 +130,35 @@ export class GuangYaPanLoginProvider implements AuthProvider {
     if (!clientId) {
       throw new AuthProviderError('请输入光鸭网盘 clientId（必填）');
     }
+
+    // 凭据过期自动刷新：携带 refreshToken 且未传手机号时，直接用 refresh_token 换取新令牌
+    if (refreshToken && !phoneRaw) {
+      const ctx = new GuangYaPanLoginContext({
+        clientId,
+        phoneNumber: '',
+        deviceId,
+        deviceSign,
+      });
+      const token = await ctx.refreshTokens(refreshToken);
+      if (!token.access_token) {
+        throw new AuthProviderError('刷新失败：未返回新的 access_token，请重新短信登录', 502, 'upstream');
+      }
+      const fields: Record<string, string | number> = {
+        refreshToken: token.refresh_token || refreshToken,
+        clientId,
+        deviceId,
+        deviceSign,
+      };
+      if (token.access_token) fields.accessToken = token.access_token;
+      if (typeof token.expires_in === 'number' && token.expires_in > 0) {
+        fields.accessTokenExpiresAt = Math.floor(Date.now() / 1000) + token.expires_in;
+      }
+      return {
+        fields,
+        message: '凭据已刷新，accessToken/refreshToken 已更新',
+      };
+    }
+
     const phoneNumber = normalizePhoneE164(phoneRaw);
     if (!phoneNumber) {
       throw new AuthProviderError('请输入手机号（如 +86 13800000000 或 13800000000）');
@@ -336,6 +366,15 @@ class GuangYaPanLoginContext {
       verification_token: verificationToken,
       username: this.opts.phoneNumber,
       client_id: this.opts.clientId,
+    });
+  }
+
+  /** refresh_token → 新 access/refresh token（凭据过期自动刷新） */
+  async refreshTokens(refreshToken: string): Promise<SigninResp> {
+    return this.post<SigninResp>('/v1/auth/token', {
+      client_id: this.opts.clientId,
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
     });
   }
 }
