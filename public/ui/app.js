@@ -750,6 +750,7 @@ const DRIVER_NAMES = {
   dropbox: 'Dropbox',
   yun139: '中国移动云盘',
   xunlei: '迅雷云盘',
+  guangyapan: '光鸭网盘',
 };
 
 const DRIVER_DESCS = {
@@ -760,6 +761,7 @@ const DRIVER_DESCS = {
   dropbox: 'Dropbox；accessToken 与 refreshToken + appKey + appSecret 二选一。',
   yun139: '中国移动云盘（139 / 和彩云）；authorization = base64("pc:<账号>:<token|...|exp>")。',
   xunlei: '迅雷云盘；必填仅 refreshToken，可用「自动登录获取凭据」一键获取并回填。',
+  guangyapan: '光鸭网盘；必填 clientId，可用「自动登录获取凭据」短信验证码登录并自动回填凭据。',
 };
 
 async function loadSettings() {
@@ -858,14 +860,17 @@ function renderDriverFormCard(key, meta) {
   btnSave.textContent = '保存配置';
   actions.appendChild(btnSave);
 
-  // 自动登录获取凭据：xunlei 支持（弹窗表单 → /api/auth/<driver>/login → 回填 refreshToken）
+  // 自动登录获取凭据：xunlei / guangyapan 支持（弹窗表单 → /api/auth/<driver>/login → 回填凭据字段）
   let btnAuth = null;
-  if (key === 'xunlei') {
+  if (key === 'xunlei' || key === 'guangyapan') {
     btnAuth = document.createElement('button');
     btnAuth.type = 'button';
     btnAuth.className = 'btn';
     btnAuth.textContent = '自动登录获取凭据';
-    btnAuth.title = '使用迅雷账号密码自动登录，获取 refreshToken 并回填表单；回填后请点击「保存配置」生效';
+    btnAuth.title =
+      key === 'guangyapan'
+        ? '使用光鸭网盘 Client ID 与手机号短信验证码自动登录，获取凭据并回填表单；回填后请点击「保存配置」生效'
+        : '使用迅雷账号密码自动登录，获取 refreshToken 并回填表单；回填后请点击「保存配置」生效';
     actions.appendChild(btnAuth);
   }
 
@@ -958,6 +963,10 @@ function renderDriverFormCard(key, meta) {
  * 密码仅经请求体传递，不落库、不回显。
  */
 function openAuthModal(driver, form, msg, flashDirty) {
+  if (driver === 'guangyapan') {
+    openGuangYaPanAuthModal(driver, form, msg, flashDirty);
+    return;
+  }
   const existing = document.getElementById('authModalOverlay');
   if (existing) existing.remove();
 
@@ -1052,6 +1061,157 @@ function openAuthModal(driver, form, msg, flashDirty) {
 
   overlay.querySelector('#authModalCancel').addEventListener('click', () => overlay.remove());
   overlay.querySelector('#authUser').focus();
+}
+
+/**
+ * 光鸭网盘自动登录获取凭据弹窗：两阶段短信验证码登录
+ *   阶段一：Client ID + 手机号 → POST /api/auth/guangyapan/login → 409 verify（响应含 verificationId）
+ *   阶段二：回填短信验证码后再次调用 → 成功回填凭据字段并提示（后端已自动落盘 KV）
+ * 可选 captchaToken：后端 captcha 需人工处理（滑块等）时填写后重试。
+ * 安全：验证码仅经请求体传递，不落库、不回显；响应仅回填可配置字段。
+ */
+function openGuangYaPanAuthModal(driver, form, msg, flashDirty) {
+  const existing = document.getElementById('authModalOverlay');
+  if (existing) existing.remove();
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.id = 'authModalOverlay';
+  overlay.innerHTML = `
+    <div class="modal">
+      <h2>光鸭网盘 自动登录</h2>
+      <p class="hint">使用 Client ID 与手机号短信验证码登录并获取凭据；验证码仅本次请求使用，不保存、不回显。成功后凭据将自动写入页面配置（KV）。</p>
+      <form id="authModalForm">
+        <label>Client ID<input type="text" id="gypClientId" autocomplete="off" required /></label>
+        <label>手机号<input type="tel" id="gypPhone" autocomplete="tel" placeholder="如 +86 13800000000 或 13800000000" required /></label>
+        <label>验证码令牌（可选）<input type="text" id="gypCaptchaToken" autocomplete="off" placeholder="后端 captcha 需人工处理时填写，可留空" /></label>
+        <label id="gypCodeRow" hidden>短信验证码<input type="text" id="gypVerifyCode" autocomplete="one-time-code" inputmode="numeric" /></label>
+        <p class="config-msg" id="authModalMsg"></p>
+        <div class="config-actions">
+          <button type="submit" class="btn btn-primary" id="authModalOk">发送验证码</button>
+          <button type="button" class="btn" id="authModalCancel">取消</button>
+        </div>
+      </form>
+    </div>`;
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) overlay.remove();
+  });
+  document.body.appendChild(overlay);
+
+  const f = overlay.querySelector('#authModalForm');
+  const m = overlay.querySelector('#authModalMsg');
+  const ok = overlay.querySelector('#authModalOk');
+  const codeRow = overlay.querySelector('#gypCodeRow');
+  const codeInput = overlay.querySelector('#gypVerifyCode');
+
+  // 预填表单中已配置的 clientId（若有）
+  const existingClientId = form.querySelector('[data-field="clientId"]');
+  if (existingClientId && existingClientId.value) {
+    overlay.querySelector('#gypClientId').value = existingClientId.value;
+  }
+
+  let verificationId = '';
+
+  const buildBody = (extra = {}) => {
+    const body = {
+      clientId: overlay.querySelector('#gypClientId').value.trim(),
+      phoneNumber: overlay.querySelector('#gypPhone').value.trim(),
+    };
+    const ct = overlay.querySelector('#gypCaptchaToken').value.trim();
+    if (ct) body.captchaToken = ct;
+    return { ...body, ...extra };
+  };
+
+  f.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const clientId = overlay.querySelector('#gypClientId').value.trim();
+    const phone = overlay.querySelector('#gypPhone').value.trim();
+    if (!clientId || !phone) {
+      m.textContent = '请输入 Client ID 与手机号';
+      m.className = 'config-msg err';
+      return;
+    }
+    ok.disabled = true;
+    m.textContent = verificationId ? '登录中…' : '发送验证码中…';
+    m.className = 'config-msg';
+    try {
+      if (!verificationId) {
+        // 阶段一：仅发送验证码；后端必然返回 409 verify（携带 verificationId），成功路径不会走到这里
+        await fetchJson(`/api/auth/${encodeURIComponent(driver)}/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(buildBody()),
+        });
+      }
+      // 阶段二：携带验证码完成登录
+      const code = codeInput.value.trim();
+      if (!verificationId || !code) {
+        m.textContent = '请先点击「发送验证码」并填写收到的短信验证码';
+        m.className = 'config-msg err';
+        ok.disabled = false;
+        return;
+      }
+      const data = await fetchJson(`/api/auth/${encodeURIComponent(driver)}/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildBody({ verifyCode: code, verificationId })),
+      });
+      if (!data.ok) throw new Error(data.error || '登录失败');
+      // 回填可回填字段（refreshToken / accessToken / deviceId 等）
+      let filled = 0;
+      for (const [name, value] of Object.entries(data.fields || {})) {
+        const el = form.querySelector(`[data-field="${name}"]`);
+        if (el) {
+          el.value = String(value);
+          filled++;
+        }
+      }
+      overlay.remove();
+      if (filled > 0) {
+        const rt = form.querySelector('[data-field="refreshToken"]');
+        if (rt) {
+          rt.classList.add('auth-filled');
+          setTimeout(() => rt.classList.remove('auth-filled'), 4000);
+        }
+        msg.textContent = (data.persisted ? '凭据已落盘（KV），' : '') + (data.message || '已获取，请保存');
+        msg.className = 'config-msg ok-flash';
+        setTimeout(() => { msg.className = 'config-msg'; }, 5000);
+        flashDirty();
+      } else {
+        msg.textContent = '登录成功，但表单中没有可回填字段，请手动填写';
+        msg.className = 'config-msg err';
+      }
+    } catch (err) {
+      let text = err.message || '登录失败';
+      let kind = '';
+      const m2 = /(\{.*\})/.exec(text);
+      if (m2) {
+        try {
+          const j = JSON.parse(m2[1]);
+          text = j.error || text;
+          kind = j.kind || '';
+          // 阶段一 409：收到 verificationId → 切换到待填验证码状态
+          if (j.verificationId) {
+            verificationId = String(j.verificationId);
+            codeRow.hidden = false;
+            codeInput.focus();
+            ok.textContent = '登录并获取';
+            m.textContent = '验证码已发送，请填写收到的短信验证码';
+            m.className = 'config-msg ok-flash';
+            ok.disabled = false;
+            return;
+          }
+        } catch (_) {}
+      }
+      if (kind === 'verify') text = '需要人工处理验证：' + text;
+      m.textContent = text;
+      m.className = 'config-msg err';
+      ok.disabled = false;
+    }
+  });
+
+  overlay.querySelector('#authModalCancel').addEventListener('click', () => overlay.remove());
+  overlay.querySelector('#gypClientId').focus();
 }
 
 function renderSettings(box, s, cfg) {

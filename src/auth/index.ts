@@ -91,8 +91,14 @@ export async function handleAuthApi(c: Context, route: AuthRoute): Promise<Respo
     });
   } catch (e) {
     if (e instanceof AuthProviderError) {
+      // 透传提供者附加的中间状态（如光鸭两阶段登录的 verificationId），供前端进入下一阶段
+      const extra: Record<string, unknown> = {};
+      for (const k of Object.keys(e)) {
+        if (k === 'name' || k === 'message' || k === 'stack' || k === 'status' || k === 'kind') continue;
+        extra[k] = (e as unknown as Record<string, unknown>)[k];
+      }
       return c.json(
-        { ok: false, error: e.message, kind: e.kind },
+        { ok: false, error: e.message, kind: e.kind, ...extra },
         e.status as 400 | 404 | 409 | 502
       );
     }
