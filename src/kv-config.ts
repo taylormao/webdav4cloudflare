@@ -14,7 +14,7 @@
 import type { AppConfig, StorageType } from './config';
 
 /** 可自助配置的驱动类型（与 StorageType 一致） */
-export const KV_DRIVER_KEYS: StorageType[] = ['s3', 'telegram', 'baidu', 'gdrive', 'dropbox', 'yun139', 'xunlei'];
+export const KV_DRIVER_KEYS: StorageType[] = ['s3', 'telegram', 'baidu', 'gdrive', 'dropbox', 'yun139', 'xunlei', 'guangyapan'];
 
 /** 驱动字段元数据：后端校验 + 脱敏元数据 + 前端表单渲染共用 */
 export interface DriverFieldSchema {
@@ -73,6 +73,23 @@ export const DRIVER_FIELD_SCHEMAS: Record<StorageType, DriverFieldSchema[]> = {
     { name: 'removeWay', type: 'string', required: false, secret: false, default: 'trash', hint: '删除方式：trash（回收站，默认）/ delete（彻底删除）' },
     { name: 'signTimestamp', type: 'string', required: false, secret: false, hint: '验证码签名时间戳（显式签名模式；与下方 signCaptchaSign 成对）' },
     { name: 'signCaptchaSign', type: 'string', required: false, secret: false, hint: '验证码签名值（显式签名模式；与上方 signTimestamp 成对）' },
+  ],
+  guangyapan: [
+    { name: 'clientId', type: 'string', required: true, secret: false, hint: '光鸭网盘 Client ID（Web 端抓取，必填）' },
+    { name: 'refreshToken', type: 'string', required: false, secret: true, hint: 'Refresh Token（敏感；短信登录自动获取）' },
+    { name: 'accessToken', type: 'string', required: false, secret: true, hint: 'Access Token（敏感；可选，过期自动用 refreshToken 刷新）' },
+    { name: 'accessTokenExpiresAt', type: 'string', required: false, secret: false, hint: 'access_token 过期时间戳（秒，可选）' },
+    { name: 'rootPath', type: 'string', required: false, secret: false, default: '/', hint: '挂载根目录（可填文件夹路径，如 /我的文件/资料；留空为网盘根）' },
+    { name: 'phoneNumber', type: 'string', required: false, secret: false, hint: '登录手机号（如 +86 13800000000）' },
+    { name: 'captchaToken', type: 'string', required: false, secret: false, hint: '验证码令牌（可选；手动从光鸭页面获取时填写）' },
+    { name: 'sendCode', type: 'boolean', required: false, secret: false, default: false, hint: '保存后发送短信验证码（发送后自动复位为 false）' },
+    { name: 'verifyCode', type: 'string', required: false, secret: false, hint: '短信验证码（与下方 verificationId 一起保存完成登录）' },
+    { name: 'verificationId', type: 'string', required: false, secret: false, hint: '验证码会话 ID（发送验证码后回填）' },
+    { name: 'deviceId', type: 'string', required: false, secret: false, hint: '设备 ID（32 位十六进制；留空自动随机生成）' },
+    { name: 'deviceSign', type: 'string', required: false, secret: false, hint: '设备签名（留空自动生成 wdi10.<deviceId>）' },
+    { name: 'pageSize', type: 'string', required: false, secret: false, default: '300', hint: '列表每页大小（默认 300）' },
+    { name: 'orderBy', type: 'string', required: false, secret: false, default: '0', hint: '排序字段：0=文件名 1=文件大小 2=修改时间（默认 0）' },
+    { name: 'sortType', type: 'string', required: false, secret: false, default: '1', hint: '排序方向：1=升序 2=降序（默认 1）' },
   ],
 };
 

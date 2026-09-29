@@ -8,7 +8,7 @@
 
 import { KV_DRIVER_KEYS, readKvDriverConfig, sanitizeDriverConfig, applyDriverConfigPatch } from './kv-config';
 
-export type StorageType = 's3' | 'telegram' | 'baidu' | 'gdrive' | 'dropbox' | 'yun139' | 'xunlei';
+export type StorageType = 's3' | 'telegram' | 'baidu' | 'gdrive' | 'dropbox' | 'yun139' | 'xunlei' | 'guangyapan';
 
 export interface AuthConfig {
   user: string;
@@ -79,6 +79,32 @@ export interface XunleiConfig {
   signCaptchaSign?: string;
 }
 
+/**
+ * 光鸭网盘配置（对应 OpenList guangyapan Addition）：
+ * clientId 必填；鉴权凭据 accessToken（可选）/ refreshToken（可选）至少其一，
+ * 可由短信验证码登录（/api/auth/guangyapan/login）自动获取并回填；
+ * rootPath 可指定挂载根目录（逐级解析文件夹，留空为网盘根）；
+ * sendCode 置 true 保存即发送短信验证码并自动复位 false；verifyCode + verificationId 完成登录；
+ * pageSize/orderBy/sortType 控制列表分页与排序。
+ */
+export interface GuangYaPanConfig {
+  clientId: string;
+  refreshToken?: string;
+  accessToken?: string;
+  accessTokenExpiresAt?: number;
+  rootPath?: string;
+  phoneNumber?: string;
+  captchaToken?: string;
+  sendCode?: boolean;
+  verifyCode?: string;
+  verificationId?: string;
+  deviceId?: string;
+  deviceSign?: string;
+  pageSize?: number;
+  orderBy?: number;
+  sortType?: number;
+}
+
 export interface LogConfig {
   enabled: boolean; // 是否写 D1 请求日志（LOG_ENABLED != 'false' 且已绑定 D1）
   table: string;
@@ -94,6 +120,7 @@ export interface AppConfig {
   dropbox: DropboxConfig;
   yun139: Yun139Config;
   xunlei: XunleiConfig;
+  guangyapan: GuangYaPanConfig;
   log: LogConfig;
 }
 
@@ -135,6 +162,21 @@ interface RawEnv {
   XUNLEI_REMOVE_WAY?: string;
   XUNLEI_SIGN_TIMESTAMP?: string;
   XUNLEI_SIGN_CAPTCHA_SIGN?: string;
+  GUANGYAPAN_CLIENT_ID?: string;
+  GUANGYAPAN_REFRESH_TOKEN?: string;
+  GUANGYAPAN_ACCESS_TOKEN?: string;
+  GUANGYAPAN_ACCESS_TOKEN_EXPIRES_AT?: string;
+  GUANGYAPAN_ROOT_PATH?: string;
+  GUANGYAPAN_PHONE_NUMBER?: string;
+  GUANGYAPAN_CAPTCHA_TOKEN?: string;
+  GUANGYAPAN_SEND_CODE?: string;
+  GUANGYAPAN_VERIFY_CODE?: string;
+  GUANGYAPAN_VERIFICATION_ID?: string;
+  GUANGYAPAN_DEVICE_ID?: string;
+  GUANGYAPAN_DEVICE_SIGN?: string;
+  GUANGYAPAN_PAGE_SIZE?: string;
+  GUANGYAPAN_ORDER_BY?: string;
+  GUANGYAPAN_SORT_TYPE?: string;
   LOG_ENABLED?: string;
   [key: string]: unknown;
 }
@@ -220,12 +262,30 @@ function buildBaseConfig(env: RawEnv): AppConfig {
     signCaptchaSign: env.XUNLEI_SIGN_CAPTCHA_SIGN ?? undefined,
   };
 
+  const guangyapan: GuangYaPanConfig = {
+    clientId: env.GUANGYAPAN_CLIENT_ID ?? '',
+    refreshToken: env.GUANGYAPAN_REFRESH_TOKEN ?? undefined,
+    accessToken: env.GUANGYAPAN_ACCESS_TOKEN ?? undefined,
+    accessTokenExpiresAt: parseTimestamp(env.GUANGYAPAN_ACCESS_TOKEN_EXPIRES_AT),
+    rootPath: env.GUANGYAPAN_ROOT_PATH ?? undefined,
+    phoneNumber: env.GUANGYAPAN_PHONE_NUMBER ?? undefined,
+    captchaToken: env.GUANGYAPAN_CAPTCHA_TOKEN ?? undefined,
+    sendCode: (env.GUANGYAPAN_SEND_CODE ?? 'false') === 'true',
+    verifyCode: env.GUANGYAPAN_VERIFY_CODE ?? undefined,
+    verificationId: env.GUANGYAPAN_VERIFICATION_ID ?? undefined,
+    deviceId: env.GUANGYAPAN_DEVICE_ID ?? undefined,
+    deviceSign: env.GUANGYAPAN_DEVICE_SIGN ?? undefined,
+    pageSize: parseTimestamp(env.GUANGYAPAN_PAGE_SIZE),
+    orderBy: parseTimestamp(env.GUANGYAPAN_ORDER_BY),
+    sortType: parseTimestamp(env.GUANGYAPAN_SORT_TYPE),
+  };
+
   const log: LogConfig = {
     enabled: (env.LOG_ENABLED ?? 'true') !== 'false',
     table: 'webdav_logs',
   };
 
-  return { storageType, auth, s3, telegram, baidu, gdrive, dropbox, yun139, xunlei, log };
+  return { storageType, auth, s3, telegram, baidu, gdrive, dropbox, yun139, xunlei, guangyapan, log };
 }
 
 /** 解析可选数字环境变量（空/非法返回 undefined，供 accessTokenExpiresAt 等时间戳使用） */
@@ -244,6 +304,7 @@ function normalizeStorageType(v?: string): StorageType {
     case 'dropbox':
     case 'yun139':
     case 'xunlei':
+    case 'guangyapan':
       return v;
     default:
       return 's3';
@@ -270,6 +331,8 @@ export function driverConfigured(key: string, cfg: AppConfig): boolean {
       return !!cfg.yun139.authorization;
     case 'xunlei':
       return !!cfg.xunlei.refreshToken;
+    case 'guangyapan':
+      return !!(cfg.guangyapan.clientId && (cfg.guangyapan.refreshToken || cfg.guangyapan.accessToken));
     default:
       return false;
   }

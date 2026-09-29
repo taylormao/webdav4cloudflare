@@ -16,6 +16,7 @@ import { GDriveDriver } from './gdrive';
 import { DropboxDriver } from './dropbox';
 import { Yun139Driver } from './yun139';
 import { XunleiDriver } from './xunlei';
+import { GuangYaPanDriver } from './guangyapan';
 
 /** 驱动所需的 Workers bindings（KV / R2） */
 export interface DriverEnv {
@@ -37,6 +38,7 @@ const DRIVER_FACTORIES: ReadonlyArray<[string, DriverFactory]> = [
   ['dropbox', (cfg) => new DropboxDriver(cfg.dropbox)],
   ['yun139', (cfg) => new Yun139Driver(cfg.yun139)],
   ['xunlei', (cfg) => new XunleiDriver(cfg.xunlei)],
+  ['guangyapan', (cfg) => new GuangYaPanDriver(cfg.guangyapan)],
 ];
 
 /**

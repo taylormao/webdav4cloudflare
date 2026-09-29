@@ -14,10 +14,12 @@ import type { Context } from 'hono';
 import type { AuthLoginParams } from './types';
 import { AuthProviderError } from './types';
 import { XunleiLoginProvider } from './xunlei-login';
+import { GuangYaPanLoginProvider } from './guangyapan-login';
 
 /** 自动登录提供者注册表：driver 标识 → 实现 */
 export const AUTH_PROVIDERS: Readonly<Record<string, { login: (p: AuthLoginParams) => Promise<{ fields: Record<string, string | number>; message?: string }> }>> = {
   xunlei: new XunleiLoginProvider(),
+  guangyapan: new GuangYaPanLoginProvider(),
 };
 
 export interface AuthRoute {
