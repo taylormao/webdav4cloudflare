@@ -883,11 +883,11 @@ async function ossMultipartUpload(
   }
 }
 
-/** OSS 公共头：x-oss-date（代替禁用的 Date 头）+ 可选安全令牌 */
+/** OSS 公共头：标准 Date 头（对齐 Go SDK）+ 可选安全令牌 */
 function ossCommonHeaders(creds: OssCreds, contentType: string): Record<string, string> {
   const headers: Record<string, string> = {
     'Content-Type': contentType,
-    'x-oss-date': new Date().toUTCString(),
+    'Date': new Date().toUTCString(),
   };
   if (creds.token) headers['x-oss-security-token'] = creds.token;
   return headers;
@@ -897,8 +897,7 @@ function ossCommonHeaders(creds: OssCreds, contentType: string): Record<string, 
  * OSS V1 签名（与 aliyun-oss-go-sdk 对齐）：
  * StringToSign = VERB + "\n" + Content-MD5 + "\n" + Content-Type + "\n" + Date + "\n"
  *              + CanonicalizedOSSHeaders + CanonicalizedResource
- * Workers fetch 不允许设置 Date 头，改用 x-oss-date 承载时间（阿里云 OSS 支持），
- * 该头同时计入 CanonicalizedOSSHeaders。
+ * 与 Go SDK 一致：使用标准 Date 头承载时间（GMT），不发送 x-oss-date。
  */
 async function ossSign(
   creds: OssCreds,
@@ -906,7 +905,7 @@ async function ossSign(
   resource: string,
   headers: Record<string, string>
 ): Promise<string> {
-  const date = headers['x-oss-date'] ?? '';
+  const date = headers['Date'] ?? '';
   const canonicalizedOssHeaders = Object.keys(headers)
     .filter((k) => k.toLowerCase().startsWith('x-oss-'))
     .map((k) => k.toLowerCase())
