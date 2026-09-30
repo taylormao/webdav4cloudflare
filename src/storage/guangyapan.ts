@@ -666,10 +666,10 @@ export class GuangYaPanDriver implements StorageDriver {
 
     if (bytes.byteLength === 0) {
       // 0 字节走单 PUT；其余大小统一走 Multipart（对齐 Go guangyapan_ref/driver.go L435-439）
-      await ossPutObject(objectUrl, encodedKey, new Uint8Array(0), creds);
+      await ossPutObject(objectUrl, encodedKey, new Uint8Array(0), creds, token.bucketName!);
       return;
     }
-    await ossMultipartUpload(objectUrl, encodedKey, bytes, creds);
+    await ossMultipartUpload(objectUrl, encodedKey, bytes, creds, token.bucketName!);
   }
 
   async remove(path: string): Promise<void> {
@@ -795,10 +795,11 @@ async function ossPutObject(
   url: string,
   encodedKey: string,
   bytes: Uint8Array,
-  creds: OssCreds
+  creds: OssCreds,
+  bucket: string
 ): Promise<void> {
   const headers = ossCommonHeaders(creds, 'application/octet-stream');
-  const authorization = await ossSign(creds, 'PUT', `/${encodedKey}`, headers);
+  const authorization = await ossSign(creds, 'PUT', `/${bucket}/${encodedKey}`, headers);
   const res = await fetch(url, {
     method: 'PUT',
     headers: { ...headers, Authorization: authorization },
@@ -814,7 +815,8 @@ async function ossMultipartUpload(
   url: string,
   encodedKey: string,
   bytes: Uint8Array,
-  creds: OssCreds
+  creds: OssCreds,
+  bucket: string
 ): Promise<void> {
   const partSize = calcUploadPartSize(bytes.byteLength);
   const partCount = Math.max(1, Math.ceil(bytes.byteLength / partSize));
@@ -822,7 +824,7 @@ async function ossMultipartUpload(
   // 1) 创建分片任务
   const initUrl = url + '?uploads';
   const initHeaders = ossCommonHeaders(creds, 'application/xml');
-  const initAuth = await ossSign(creds, 'POST', `/${encodedKey}?uploads`, initHeaders);
+  const initAuth = await ossSign(creds, 'POST', `/${bucket}/${encodedKey}?uploads`, initHeaders);
   const initRes = await fetch(initUrl, {
     method: 'POST',
     headers: { ...initHeaders, Authorization: initAuth },
@@ -843,7 +845,7 @@ async function ossMultipartUpload(
     const part = bytes.subarray(offset, Math.min(offset + partSize, bytes.byteLength));
     // 请求 URL 的 query 需 URL 编码以正确传输（uploadId 可能含 +/=）；签名 resource 用原始值（OSS 服务端解码 query 后按原始值校验签名）
     const partUrl = url + `?partNumber=${i + 1}&uploadId=${encodeURIComponent(uploadId)}`;
-    const resource = `/${encodedKey}?partNumber=${i + 1}&uploadId=${uploadId}`;
+    const resource = `/${bucket}/${encodedKey}?partNumber=${i + 1}&uploadId=${uploadId}`;
     const partHeaders = ossCommonHeaders(creds, 'application/octet-stream');
     const partAuth = await ossSign(creds, 'PUT', resource, partHeaders);
     const partRes = await fetch(partUrl, {
@@ -870,7 +872,7 @@ async function ossMultipartUpload(
     '</CompleteMultipartUpload>';
   const completeUrl = url + `?uploadId=${encodeURIComponent(uploadId)}`;
   // 同上：签名 resource 使用原始 uploadId
-  const completeResource = `/${encodedKey}?uploadId=${uploadId}`;
+  const completeResource = `/${bucket}/${encodedKey}?uploadId=${uploadId}`;
   const completeHeaders = ossCommonHeaders(creds, 'application/xml');
   const completeAuth = await ossSign(creds, 'POST', completeResource, completeHeaders);
   const completeRes = await fetch(completeUrl, {
