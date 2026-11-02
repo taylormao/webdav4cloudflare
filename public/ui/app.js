@@ -769,6 +769,16 @@ function previewUrl(path) {
   return `/api/preview?path=${encodeURIComponent(path)}&auth=${encodeURIComponent(auth)}`;
 }
 
+/**
+ * 媒体内联中继 URL（/api/stream）。
+ * 光鸭 CDN 对 Range 响应强制带 Content-Disposition: attachment 且无 CORS，
+ * 302 后 Worker 无法改写，<video> 拿不到媒体源；改走同源中继由 Worker 重写头部。
+ */
+function streamUrl(path) {
+  const auth = creds ? btoa(`${creds.user}:${creds.pass}`) : '';
+  return `/api/stream?path=${encodeURIComponent(path)}&auth=${encodeURIComponent(auth)}`;
+}
+
 /** 探测媒体容器（/api/preview?probe=1）：返回 { size, contentType, container, playable, hint } */
 async function probeMedia(path) {
   try {
@@ -798,6 +808,75 @@ function renderUnplayable(box, path, probe) {
   wrap.append(tip, meta, btn);
   box.innerHTML = '';
   box.appendChild(wrap);
+}
+
+const STALL_HINT_TIMEOUT = 15000; // 卡顿判定阈值：15 秒无进展即提示
+
+/** 已缓冲到的最大时间点（秒）；异常时返回 0 */
+function bufferedEnd(media) {
+  try {
+    const b = media.buffered;
+    return b && b.length ? b.end(b.length - 1) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 加载卡顿兜底：触发 stalled / waiting 后 15 秒内 buffered 无增长且播放进度未推进，
+ * 提示「加载缓慢，建议下载后观看」并给出下载按钮，避免无限黑屏等待。
+ */
+function attachStallFallback(media, box, path, size) {
+  let timer = null;
+  let baseline = 0;
+  let shown = false;
+
+  const clear = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+
+  const showHint = (text) => {
+    if (shown) return;
+    shown = true;
+    clear();
+    const bar = document.createElement('div');
+    bar.style.cssText = 'display:flex;align-items:center;gap:10px;margin-top:8px;';
+    const tip = document.createElement('span');
+    tip.style.cssText = 'color:#b8860b;font-size:12px;';
+    tip.textContent = text;
+    const btn = mkBtn('下载该文件', 'btn-sm', () => downloadFile(path, size));
+    bar.append(tip, btn);
+    box.appendChild(bar);
+  };
+
+  const progressed = () => bufferedEnd(media) > baseline + 0.1 || media.currentTime > 0.1 || media.readyState >= 3;
+
+  const arm = () => {
+    if (shown || timer) return;
+    baseline = bufferedEnd(media);
+    timer = setTimeout(() => {
+      timer = null;
+      if (progressed()) return; // 15 秒内有缓冲增长或已开始播放，不算卡顿
+      showHint('加载缓慢，建议下载后观看。');
+    }, STALL_HINT_TIMEOUT);
+  };
+
+  media.addEventListener('loadstart', arm);
+  media.addEventListener('stalled', arm);
+  media.addEventListener('waiting', arm);
+  media.addEventListener('progress', () => {
+    if (progressed()) clear();
+  });
+  media.addEventListener('timeupdate', () => {
+    if (media.currentTime > 0.1) clear();
+  });
+  media.addEventListener('playing', clear);
+  media.addEventListener('canplay', clear);
+  media.addEventListener('error', () => showHint('该文件无法在线播放，建议下载后观看。'));
+  arm();
 }
 
 /** 在线预览：文本/图片/PDF/视频/音频在模态框展示，其余提示下载 */
@@ -898,17 +977,21 @@ async function previewFile(path) {
   } else if (kind === 'video') {
     const video = document.createElement('video');
     video.controls = true;
+    video.preload = 'metadata';
     video.style.cssText = 'max-width:84vw;max-height:76vh;background:#000;';
-    video.src = url;
+    // 播放走同源内联中继，避免 CDN 的 attachment 头导致 NO_SOURCE 黑屏
+    video.src = streamUrl(path);
     bodyEl.innerHTML = '';
     bodyEl.appendChild(video);
+    attachStallFallback(video, bodyEl, path, probe && probe.size);
   } else if (kind === 'audio') {
     const audio = document.createElement('audio');
     audio.controls = true;
     audio.style.cssText = 'width:72vw;max-width:720px;';
-    audio.src = url;
+    audio.src = streamUrl(path);
     bodyEl.innerHTML = '';
     bodyEl.appendChild(audio);
+    attachStallFallback(audio, bodyEl, path, probe && probe.size);
   } else {
     bodyEl.innerHTML = '<p style="margin:0;color:#666;">该类型不支持在线预览，请下载查看。</p>';
   }

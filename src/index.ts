@@ -113,6 +113,11 @@ app.all('*', async (c) => {
           res = await handleApiStream(c, drivers, url, { disposition: 'inline' });
           break;
         }
+        case '/api/stream': {
+          // 媒体内联中继：重写上游 Content-Disposition/CORS，供 <video>/<audio> 直接播放
+          res = await handleInlineRelay(c, drivers, url);
+          break;
+        }
         case '/api/settings': {
           res = c.json(buildSettings(config, drivers));
           break;
@@ -587,6 +592,8 @@ async function handleApiStream(
       contentType,
       container,
       playable,
+      // 分流：可解码走同源内联中继 /api/stream；不可解码仍走 /api/preview 302 直连
+      mode: playable ? 'stream' : 'direct',
       // 光鸭驱动只有签名直链（signedURL / downloadUrl），无 HLS / 转码播放地址
       playUrl: null,
       hint: !playable && container === 'mpegts' ? MPEGTS_HINT : undefined,
@@ -658,6 +665,126 @@ async function handleApiStream(
     return new Response(bytes, { status: 200, headers });
   }
 
+  if (stat.size > 0) headers.set('Content-Length', String(stat.size));
+  return new Response(stream, { status: 200, headers });
+}
+
+/**
+ * 内联中继：/api/stream —— 供 <video>/<audio> 作为媒体源使用的同源端点。
+ *
+ * 为什么不能直接用 302 直链：光鸭 CDN 对 Range 响应强制附带
+ * `Content-Disposition: attachment`，且不返回 CORS 头；而 302 之后的响应头
+ * Worker 无法改写，浏览器会把媒体响应判为附件下载，<video> 于是拿到
+ * networkState=NO_SOURCE 黑屏。本端点由 Worker 取签名直链后自行 fetch 转发，
+ * 强制重写响应头（inline / 真实 Content-Type / Accept-Ranges / CORS），
+ * 并把请求的 Range 透传给上游、回传 206 + Content-Range。
+ *
+ * 与 /api/preview 的分工：
+ *   - 可解码容器（mp4/webm/mp3…）→ /api/stream 内联中继（头部正确，能出画面）
+ *   - 不可解码容器（mpegts 等）→ /api/preview 302 直连（下载/外部播放器更快）
+ */
+async function handleInlineRelay(
+  c: Context<{ Bindings: Env }>,
+  drivers: Map<string, StorageDriver>,
+  url: URL
+): Promise<Response> {
+  const p = url.searchParams.get('path');
+  if (!p) return c.text('Missing path param', 400);
+  const api = resolveApiPath(p, drivers);
+  if (!api) return c.text('Not found', 404);
+  const { storage, path } = api;
+  if (path === '/' || path.endsWith('/')) return c.text('Not a file', 400);
+
+  const stat = await storage.stat(path);
+  if (!stat || stat.isDirectory) return c.text('Not found', 404);
+
+  let contentType = stat.contentType ?? guessMime(path) ?? 'application/octet-stream';
+  if (stat.contentType && stat.contentType.startsWith('application/vnd.google-apps.')) {
+    contentType = nativeExportMime(stat.contentType, path);
+  }
+  // .ts 歧义扩展名：命中 TS 同步字节才认定视频流（TypeScript 源码不在此端点使用）
+  if (AMBIGUOUS_TS_EXTS.has(fileExt(path))) {
+    const sniffed = await sniffContainer(storage, path, stat.size);
+    if (sniffed === 'mpegts') contentType = 'video/mp2t';
+  }
+
+  const reqRange = c.req.header('range');
+  const range = parseRange(reqRange, stat.size);
+  const filename = `inline; filename*=UTF-8''${encodeURIComponent(baseName(path))}`;
+
+  /** 统一重写的响应头：inline + 真实类型 + Range 支持 + 允许同源/跨域读取 */
+  const baseHeaders = (): Headers =>
+    new Headers({
+      'Content-Type': contentType,
+      'Content-Disposition': filename,
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': 'private, max-age=30',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+      'Access-Control-Allow-Headers': 'Range, Authorization, Content-Type',
+      'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, Content-Type',
+    });
+
+  // 预检（同源请求不会触发，跨域 embed 时需要）
+  if (c.req.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: baseHeaders() });
+  }
+
+  // 首选：签名直链 + 上游 fetch（Worker 只搬字节，头部由自己写）
+  if (storage.directUrl) {
+    try {
+      const target = await storage.directUrl(path);
+      if (target) {
+        const upstreamInit: RequestInit = { method: 'GET' };
+        if (reqRange) upstreamInit.headers = { Range: reqRange };
+        const upstream = await fetch(target, upstreamInit);
+        if (upstream.ok || upstream.status === 206) {
+          const headers = baseHeaders();
+          const status = upstream.status === 206 ? 206 : 200;
+          // 上游的 Content-Range / Content-Length / Content-Type 优先（真实切片长度）
+          const upstreamRange = upstream.headers.get('content-range');
+          if (upstreamRange) headers.set('Content-Range', upstreamRange);
+          else if (status === 206 && range) {
+            headers.set(
+              'Content-Range',
+              `bytes ${range.offset}-${range.offset + range.length - 1}/${stat.size}`
+            );
+          }
+          const upstreamLen = upstream.headers.get('content-length');
+          if (upstreamLen) headers.set('Content-Length', upstreamLen);
+          else if (status === 200 && stat.size > 0) headers.set('Content-Length', String(stat.size));
+          const upstreamType = upstream.headers.get('content-type');
+          if (upstreamType && !/^application\/octet-stream$/i.test(upstreamType)) {
+            headers.set('Content-Type', upstreamType);
+          }
+          return new Response(upstream.body, { status, headers });
+        }
+        // 非 2xx：丢弃上游响应体，回退驱动直读
+        await upstream.body?.cancel();
+        console.warn('[api/stream] upstream status', upstream.status, '→ fallback to driver read');
+      }
+    } catch (e) {
+      console.warn('[api/stream] upstream fetch failed, fallback to driver read:', e);
+    }
+  }
+
+  // 兜底：驱动 read() 直读（Range 由驱动处理），响应头同样重写
+  let stream: ReadableStream | null;
+  try {
+    stream = await storage.read(path, range ?? undefined);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.startsWith('Not found')) return c.text('Not found', 404);
+    throw e;
+  }
+  if (stream === null) return c.text('Not found', 404);
+
+  const headers = baseHeaders();
+  if (range) {
+    headers.set('Content-Range', `bytes ${range.offset}-${range.offset + range.length - 1}/${stat.size}`);
+    headers.set('Content-Length', String(range.length));
+    return new Response(stream, { status: 206, headers });
+  }
   if (stat.size > 0) headers.set('Content-Length', String(stat.size));
   return new Response(stream, { status: 200, headers });
 }
