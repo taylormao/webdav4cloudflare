@@ -305,7 +305,11 @@ function renderDir(items) {
     const tdOps = document.createElement('td');
     tdOps.className = 'col-ops ops';
     if (!it.isDir) {
-      const btnDl = mkBtn('下载', 'btn-sm', async () => downloadFile(joinPath(currentPath, it.name), it.size));
+      const btnDl = mkBtn('下载', 'btn-sm', async (e) =>
+        // 默认交给浏览器原生下载；按住 Alt 强制走分片代理（可看进度，但速度受 Worker 限制）
+        downloadFile(joinPath(currentPath, it.name), it.size, { chunked: !!(e && e.altKey) })
+      );
+      btnDl.title = 'Alt+点击 使用分片代理下载';
       tdOps.appendChild(btnDl);
       const btnPv = mkBtn('预览', 'btn-sm', async () => previewFile(joinPath(currentPath, it.name)));
       tdOps.appendChild(btnPv);
@@ -525,16 +529,54 @@ async function deleteEntry(entry) {
 }
 
 /* ============================ 下载 ============================ */
-const CHUNK_THRESHOLD = 50 * 1024 * 1024; // >50MB 启用分片
 const CHUNK_CONCURRENCY = 4; // 并发 4-6
 const CHUNK_MAX = 80 * 1024 * 1024; // 单片 clamp 80MB（Workers 100MB 响应体上限留余量）
 
-async function downloadFile(path, size) {
-  if (size && size > CHUNK_THRESHOLD) {
+async function downloadFile(path, size, opts = {}) {
+  // 默认交给浏览器原生下载：直接导航到同源 /api/download（302 到上游签名直链），
+  // 不经 fetch + Blob，天然绕开目标域名无 CORS 头导致的失败与 Worker 逐字节代理限速。
+  if (!opts.chunked) {
+    const ok = await tryNativeDownload(path);
+    if (ok) return;
+  }
+  // fallback：浏览器不支持 download 属性 / 拦截了下载 / 用户按住 Alt 强制分片
+  if (size && size > 0) {
     await downloadChunked(path, size);
     return;
   }
   await downloadDirect(path);
+}
+
+/** 浏览器是否支持 <a download> 触发的原生下载 */
+function supportsNativeDownload() {
+  return typeof document !== 'undefined' && 'download' in document.createElement('a');
+}
+
+/**
+ * 原生下载：把同源 /api/download?redirect=1&auth=… 交给浏览器。
+ * - 同源导航不需要 CORS，302 之后由浏览器直连上游 CDN
+ * - 文件名由 302 响应里的 Content-Disposition 决定（跨域后 <a download> 会被忽略）
+ * @returns 是否已成功发起下载
+ */
+async function tryNativeDownload(path) {
+  if (!supportsNativeDownload()) return false;
+  const name = path.split('/').filter(Boolean).pop() || 'download';
+  const auth = creds ? btoa(`${creds.user}:${creds.pass}`) : '';
+  const href = `/api/download?path=${encodeURIComponent(path)}&redirect=1&auth=${encodeURIComponent(auth)}`;
+  try {
+    const a = document.createElement('a');
+    a.href = href;
+    a.rel = 'noopener';
+    a.download = name;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    return true;
+  } catch (err) {
+    console.warn('[download] native download unavailable, fallback to chunked:', err);
+    return false;
+  }
 }
 
 /** 小文件直接下载（单请求） */
@@ -727,17 +769,51 @@ function previewUrl(path) {
   return `/api/preview?path=${encodeURIComponent(path)}&auth=${encodeURIComponent(auth)}`;
 }
 
+/** 探测媒体容器（/api/preview?probe=1）：返回 { size, contentType, container, playable, hint } */
+async function probeMedia(path) {
+  try {
+    const res = await fetch(`/api/preview?path=${encodeURIComponent(path)}&probe=1`, {
+      headers: { ...authHeader() },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (err) {
+    console.warn('[preview] probe failed:', err);
+    return null;
+  }
+}
+
+/** MPEG-TS 等浏览器无法解码的容器：给出明确结论 + 下载入口，而不是静默黑屏 */
+function renderUnplayable(box, path, probe) {
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'max-width:520px;';
+  const tip = document.createElement('p');
+  tip.style.cssText = 'margin:0 0 10px;line-height:1.7;color:#222;';
+  tip.textContent =
+    probe.hint || '该文件为 MPEG-TS 流容器，浏览器无法在线播放，请下载后使用播放器观看。';
+  const meta = document.createElement('p');
+  meta.style.cssText = 'margin:0 0 12px;color:#666;font-size:12px;';
+  meta.textContent = `容器：${probe.container}　声明类型：${probe.contentType || '-'}　大小：${fmtSize(probe.size || 0)}`;
+  const btn = mkBtn('下载该文件', 'btn-sm', () => downloadFile(path, probe.size));
+  wrap.append(tip, meta, btn);
+  box.innerHTML = '';
+  box.appendChild(wrap);
+}
+
 /** 在线预览：文本/图片/PDF/视频/音频在模态框展示，其余提示下载 */
 async function previewFile(path) {
   const name = path.split('/').filter(Boolean).pop() || 'download';
   const ext = extOf(name);
 
+  // .ts / .mts / .m2ts 扩展名有歧义：TypeScript 源码 or MPEG-TS 视频，需探测文件头才能定性
+  const ambiguousTs = ext === 'ts' || ext === 'mts' || ext === 'm2ts' || ext === 'mpegts';
+
   let kind;
-  if (PREVIEW_TEXT_EXTS.has(ext)) kind = 'text';
-  else if (PREVIEW_IMG_EXTS.has(ext)) kind = 'image';
+  if (PREVIEW_IMG_EXTS.has(ext)) kind = 'image';
   else if (PREVIEW_PDF_EXTS.has(ext)) kind = 'pdf';
   else if (PREVIEW_VIDEO_EXTS.has(ext)) kind = 'video';
   else if (PREVIEW_AUDIO_EXTS.has(ext)) kind = 'audio';
+  else if (PREVIEW_TEXT_EXTS.has(ext) || ambiguousTs) kind = 'text';
   else kind = 'unknown';
 
   // 非文本类直接以原生标签加载 /api/preview（后端支持 Range，浏览器自动分片流式加载）
@@ -764,6 +840,23 @@ async function previewFile(path) {
   });
 
   const bodyEl = overlay.querySelector('.preview-body');
+
+  // 媒体与有歧义的 .ts 先探测容器：MPEG-TS 只有 Safari 能解，Chrome/Edge 必然黑屏报 code=4，
+  // 因此不再把地址直接丢给 <video> 让它静默失败，而是当场给结论 + 下载入口。
+  let probe = null;
+  if (kind === 'video' || kind === 'audio' || ambiguousTs) {
+    bodyEl.innerHTML = '<p style="margin:0;color:#666;">正在检测媒体容器…</p>';
+    probe = await probeMedia(path);
+    if (probe && probe.container === 'mpegts') {
+      if (probe.playable === false) {
+        renderUnplayable(bodyEl, path, probe);
+        return;
+      }
+      // Safari（AVFoundation 自带 mpegts demuxer）可解，按视频播放
+      if (kind === 'text') kind = 'video';
+    }
+  }
+
   if (kind === 'text') {
     bodyEl.innerHTML = '<p style="margin:0;color:#666;">加载中…</p>';
     try {
@@ -807,12 +900,14 @@ async function previewFile(path) {
     video.controls = true;
     video.style.cssText = 'max-width:84vw;max-height:76vh;background:#000;';
     video.src = url;
+    bodyEl.innerHTML = '';
     bodyEl.appendChild(video);
   } else if (kind === 'audio') {
     const audio = document.createElement('audio');
     audio.controls = true;
     audio.style.cssText = 'width:72vw;max-width:720px;';
     audio.src = url;
+    bodyEl.innerHTML = '';
     bodyEl.appendChild(audio);
   } else {
     bodyEl.innerHTML = '<p style="margin:0;color:#666;">该类型不支持在线预览，请下载查看。</p>';

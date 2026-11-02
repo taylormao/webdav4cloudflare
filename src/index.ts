@@ -560,7 +560,38 @@ async function handleApiStream(
   if (stat.contentType && stat.contentType.startsWith('application/vnd.google-apps.')) {
     contentType = nativeExportMime(stat.contentType, path);
   }
-  const textLike = isTextContent(contentType, path);
+  let textLike = isTextContent(contentType, path);
+
+  // .ts / .mts / .m2ts 扩展名有歧义（TypeScript 源码 vs MPEG-TS 流容器）：
+  // 光鸭等网盘常见「扩展名 mp4、实体 MPEG-TS」或后端按扩展名给了 text/plain，
+  // 只有命中 TS 同步字节（0x47）才改判为视频，否则保持文本预览行为。
+  const ext = fileExt(path);
+  let container: MediaContainer = 'unknown';
+  if (AMBIGUOUS_TS_EXTS.has(ext)) {
+    container = await sniffContainer(storage, path, stat.size);
+    if (container === 'mpegts') {
+      contentType = 'video/mp2t';
+      textLike = false;
+    }
+  }
+
+  // 媒体探测（probe=1）：前端在把地址交给 <video> 之前先确认容器，
+  // MPEG-TS 由浏览器内核直接判定「不能在线播放」，避免长时间黑屏无提示。
+  if (url.searchParams.get('probe') === '1') {
+    if (container === 'unknown') container = await sniffContainer(storage, path, stat.size);
+    if (container === 'unknown' && /mpegts|mp2t/i.test(contentType)) container = 'mpegts';
+    const playable = container === 'mpegts' ? uaSupportsMpegTs(c.req.header('user-agent') ?? '') : true;
+    return c.json({
+      path,
+      size: stat.size,
+      contentType,
+      container,
+      playable,
+      // 光鸭驱动只有签名直链（signedURL / downloadUrl），无 HLS / 转码播放地址
+      playUrl: null,
+      hint: !playable && container === 'mpegts' ? MPEGTS_HINT : undefined,
+    });
+  }
 
   // 直连上游（302）：媒体与大文件不再经 Worker 逐字节代理。
   // 浏览器拿到签名直链后直连对象存储，首字节与拖动 seek 均不再受 Worker 往返与上游限速叠加影响。
@@ -573,11 +604,17 @@ async function handleApiStream(
           Location: target,
           // 短缓存：减少重复 302 与签名换取，同时保证签名过期前会被刷新
           'Cache-Control': 'private, max-age=30',
+          // Content-Type 透传：302 无实体，但部分客户端/代理会据此预判资源类型
+          'Content-Type': contentType,
         };
         if (opts.disposition === 'attachment') {
-          // 浏览器直接导航到该地址时仍按附件下载，而非内联播放
+          // 原生下载：跨域 302 后浏览器会忽略 <a download>，文件名只能靠该头保证
           redirectHeaders['Content-Disposition'] =
             `attachment; filename*=UTF-8''${encodeURIComponent(baseName(path))}`;
+        } else {
+          // 预览必须显式 inline：一旦是 attachment，浏览器会把媒体/PDF 当下载而非内联渲染
+          redirectHeaders['Content-Disposition'] =
+            `inline; filename*=UTF-8''${encodeURIComponent(baseName(path))}`;
         }
         return new Response(null, { status: 302, headers: redirectHeaders });
       }
@@ -654,6 +691,68 @@ function guessMime(path: string): string | undefined {
   };
   return map[ext];
 }
+/* ============================ 媒体容器探测（MPEG-TS 兜底） ============================ */
+
+/** 媒体容器类型（当前只区分影响浏览器解码能力的两类） */
+type MediaContainer = 'mpegts' | 'mp4' | 'unknown';
+
+/** TS 取样长度：覆盖 188 字节包边界（0 / 188 / 376 处应为同步字节 0x47） */
+const TS_SNIFF_BYTES = 377;
+
+/** 扩展名有歧义（TypeScript 源码 vs MPEG-TS 流）：需嗅探文件头才能定性 */
+const AMBIGUOUS_TS_EXTS = new Set(['ts', 'mts', 'm2ts', 'mpegts']);
+
+/** 取小写扩展名（不含点） */
+function fileExt(path: string): string {
+  const i = path.lastIndexOf('.');
+  return i < 0 ? '' : path.slice(i + 1).toLowerCase();
+}
+
+/**
+ * 按文件头识别容器：
+ *   - fMP4 / MP4：偏移 4 起为 "ftyp"
+ *   - MPEG-TS：188 字节包，0 / 188 / 376 处均为 0x47
+ *   - m2ts：192 字节包（4 字节时间戳前缀），4 / 196 处为 0x47
+ */
+function detectContainer(b: Uint8Array): MediaContainer {
+  if (b.length >= 8 && b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70) return 'mp4';
+  if (b.length >= 377 && b[0] === 0x47 && b[188] === 0x47 && b[376] === 0x47) return 'mpegts';
+  if (b.length >= 197 && b[4] === 0x47 && b[196] === 0x47) return 'mpegts';
+  if (b.length >= 2 && b[0] === 0x47 && b[1] !== 0x47) return 'mpegts';
+  return 'unknown';
+}
+
+/** 读取文件头识别容器；任何失败都返回 unknown，不阻断主流程 */
+async function sniffContainer(
+  storage: StorageDriver,
+  path: string,
+  size?: number
+): Promise<MediaContainer> {
+  const length = size && size > 0 ? Math.min(TS_SNIFF_BYTES, size) : TS_SNIFF_BYTES;
+  try {
+    const stream = await storage.read(path, { offset: 0, length });
+    if (!stream) return 'unknown';
+    const { bytes } = await readUpTo(stream, length);
+    return detectContainer(bytes);
+  } catch (e) {
+    console.warn('[api] container sniff failed, treat as unknown:', e);
+    return 'unknown';
+  }
+}
+
+/**
+ * 浏览器能否解码 MPEG-TS：
+ * 只有 Safari（iOS/macOS 的 AVFoundation）内置 mpegts demuxer，
+ * Chrome / Edge / Firefox 的 FFmpeg demuxer 均不含 mpegts，必然黑屏并抛 MEDIA_ERR_SRC_NOT_SUPPORTED。
+ */
+function uaSupportsMpegTs(ua: string): boolean {
+  const chromeLike = /(Chrome|CriOS|Chromium|Edg|OPR|Firefox|FxiOS)\//.test(ua);
+  return /Safari\//.test(ua) && !chromeLike;
+}
+
+/** MPEG-TS 不可在线播放时的统一提示文案 */
+const MPEGTS_HINT = '该文件为 MPEG-TS 流容器，浏览器无法在线播放，请下载后使用播放器观看。';
+
 /** 判断是否为文本类内容（预览截断用） */
 function isTextContent(contentType: string, path: string): boolean {
   if (contentType.startsWith('text/')) return true;
