@@ -6,9 +6,14 @@
  * 仅 1.4~9.6KB/s，且首字节 7~9s。因此对属于该 CDN 的直链统一附加
  * Chrome 浏览器特征头，复刻浏览器请求上下文。
  *
- * 同时提供两重自愈：
- *   1. 上游返回 4xx/5xx（含签名过期）→ 重试一次（可换新直链）
- *   2. 读取前 64KB 超过 8s（判定被限速/卡死）→ 取消该连接并重试一次
+ * 自愈策略（默认与诊断分离）：
+ *   1. 默认路径（正常播放 / 正常读取）：拿到响应即透传原始流，不做任何阻塞式探测，
+ *      首字节延迟等于上游 TTFB（毫秒级）；仅在 4xx/5xx（含签名过期）时重试一次。
+ *   2. 诊断路径（请求显式带 probe=1 / debug=1 时才启用，opts.probeFirst=true）：
+ *      额外读取前 64KB 做吞吐探测，超过 8s 判定被限速 → 取消连接并重试一次。
+ *
+ * 说明：实测光鸭 CDN 单连接限速约 200KB/s，对 838kbps（≈105KB/s）的视频码率足够，
+ * 而 64KB 阻塞探测会给每次 Range 请求平白叠加数十毫秒到数秒 TTFB，故移出正常路径。
  */
 
 /** Chrome 131 / Windows 完整 UA（与真实浏览器抓包一致） */
@@ -67,7 +72,7 @@ export interface UpstreamFetchResult {
   attempts: number;
   /** 是否因首段吞吐超时被判为慢速 */
   slow: boolean;
-  /** 首个 64KB（或流结束）耗时，用于日志定位 */
+  /** 首个 64KB（或流结束）耗时；未启用探测时即上游 TTFB，用于日志定位 */
   probeMs: number;
   /** 探测阶段实际读取字节数 */
   probedBytes: number;
@@ -83,6 +88,11 @@ export interface UpstreamFetchOptions {
   refreshUrl?: () => Promise<string | null>;
   /** 最大尝试次数，默认 2（首次 + 重试一次） */
   maxAttempts?: number;
+  /**
+   * 是否在返回前做首段吞吐探测（默认 false = 直接透传，毫秒级 TTFB）。
+   * 仅当请求显式带 probe=1 / debug=1 的诊断场景置为 true。
+   */
+  probeFirst?: boolean;
   probeBytes?: number;
   probeTimeoutMs?: number;
 }
@@ -164,13 +174,15 @@ async function probeThenRebuild(
 
 /**
  * 发起上游直链请求（自动附加浏览器特征头）。
- * 命中「4xx/5xx」或「首段 64KB 超 8s」时自动重试一次并打印日志，最多 attempts 次。
+ * 默认直接透传原始流（不探测）；仅 4xx/5xx 时重试一次。
+ * 当 opts.probeFirst=true（诊断场景）时额外做首段 64KB 探测，慢速同样重试一次。
  */
 export async function fetchUpstreamGuarded(
   rawUrl: string,
   opts: UpstreamFetchOptions
 ): Promise<UpstreamFetchResult> {
   const maxAttempts = Math.max(1, opts.maxAttempts ?? 2);
+  const probeFirst = opts.probeFirst === true;
   const probeBytes = opts.probeBytes ?? PROBE_BYTES;
   const probeTimeoutMs = opts.probeTimeoutMs ?? PROBE_TIMEOUT_MS;
   let url = rawUrl;
@@ -192,11 +204,12 @@ export async function fetchUpstreamGuarded(
 
     if (res) {
       const isLastAttempt = attempt >= maxAttempts;
-      // 最后一次尝试不再做吞吐探测：直接透传原始流，保证下游一定有数据可读
-      // （否则两次都被限速时会返回空 body + 非 0 Content-Length，比慢更糟）
-      const probe: ProbeOutcome = isLastAttempt
-        ? { body: res.body, slow: false, bytes: 0 }
-        : await probeThenRebuild(res, probeBytes, probeTimeoutMs);
+      // 仅在诊断场景（probe=1/debug=1）做吞吐探测；最后一次尝试无论如何都直接透传，
+      // 保证下游一定有数据可读（否则两次都被限速时会返回空 body + 非 0 Content-Length，比慢更糟）
+      const useProbe = probeFirst && !isLastAttempt;
+      const probe: ProbeOutcome = useProbe
+        ? await probeThenRebuild(res, probeBytes, probeTimeoutMs)
+        : { body: res.body, slow: false, bytes: 0 };
       const result: UpstreamFetchResult = {
         status: res.status,
         ok: res.ok,
@@ -213,9 +226,13 @@ export async function fetchUpstreamGuarded(
           console.log(
             `[upstream:${opts.tag}] ${res.status} accepted on last attempt (attempt ${attempt}, ttfb ${result.probeMs}ms)`
           );
-        } else {
+        } else if (useProbe) {
           console.log(
             `[upstream:${opts.tag}] ${res.status} first ${probe.bytes}B in ${result.probeMs}ms (attempt ${attempt})`
+          );
+        } else {
+          console.log(
+            `[upstream:${opts.tag}] ${res.status} passthrough (attempt ${attempt}, ttfb ${result.probeMs}ms)`
           );
         }
         return result;

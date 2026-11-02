@@ -680,8 +680,9 @@ export class GuangYaPanDriver implements StorageDriver {
    *
    * 1) 直链域名属 guangyacdn.com 时统一附加 Chrome UA / Referer / Origin
    *    （CDN 对非浏览器 UA 的请求会严重限速：实测 1.4~9.6KB/s vs 浏览器 40MB/s）；
-   * 2) 上游 4xx/5xx（含签名过期）或首段 64KB 读取超过 8s 时，自动重试一次；
-   *    签名过期场景重试前先换新直链。
+   * 2) 拿到响应即透传原始流，不做 64KB 阻塞探测（会把每次 Range 的 TTFB 拖到秒级）；
+   * 3) 仅上游 4xx/5xx（含签名过期）时自动重试一次，重试前先换新直链。
+   *    慢速探测仅在请求带 probe=1/debug=1 的诊断路径启用（见 index.ts /api/stream）。
    */
   private async fetchDirect(
     url: string,

@@ -593,8 +593,9 @@ async function handleApiStream(
       contentType,
       container,
       playable,
-      // 分流：可解码走同源内联中继 /api/stream；不可解码仍走 /api/preview 302 直连
-      mode: playable ? 'stream' : 'direct',
+      // 播放链路：前端默认一律 /api/preview 302 直连（CDN 直出，毫秒级 TTFB）；
+      // /api/stream 中继只在直连 error 时兜底重试一次，故此处不再区分 stream/direct
+      mode: 'direct',
       // 光鸭驱动只有签名直链（signedURL / downloadUrl），无 HLS / 转码播放地址
       playUrl: null,
       hint: !playable && container === 'mpegts' ? MPEGTS_HINT : undefined,
@@ -719,16 +720,17 @@ async function cachedStreamUrl(
 /**
  * 内联中继：/api/stream —— 供 <video>/<audio> 作为媒体源使用的同源端点。
  *
- * 为什么不能直接用 302 直链：光鸭 CDN 对 Range 响应强制附带
- * `Content-Disposition: attachment`，且不返回 CORS 头；而 302 之后的响应头
- * Worker 无法改写，浏览器会把媒体响应判为附件下载，<video> 于是拿到
- * networkState=NO_SOURCE 黑屏。本端点由 Worker 取签名直链后自行 fetch 转发，
- * 强制重写响应头（inline / 真实 Content-Type / Accept-Ranges / CORS），
- * 并把请求的 Range 透传给上游、回传 206 + Content-Range。
+ * 为什么不能直接用 302 直链（历史结论，已被实测推翻，保留说明）：
+ * 光鸭 CDN 对 Range 响应附带 `Content-Disposition: attachment` 且不返回 CORS 头，
+ * 但实测 attachment 只影响顶层导航（下载），不影响 <video>/<audio> 按 Content-Type
+ * 与 206 解码；缺 CORS 只影响 fetch/XHR 拉流，不影响媒体元素直接加载。
+ * 因中继吞吐（1.4~58KB/s）远低于 CDN 直连（~200KB/s），前端默认已改回 /api/preview
+ * 302 直连，本端点保留为「直连出错时的一次性兜底」与调试入口。
  *
- * 与 /api/preview 的分工：
- *   - 可解码容器（mp4/webm/mp3…）→ /api/stream 内联中继（头部正确，能出画面）
- *   - 不可解码容器（mpegts 等）→ /api/preview 302 直连（下载/外部播放器更快）
+ * 与 /api/preview 的分工（现状）：
+ *   - 默认播放 → /api/preview 302 直连（毫秒级 TTFB，CDN 直出）
+ *   - 直连 <video>/<audio> 触发 error → 前端改指本端点重试一次（头部由 Worker 重写）
+ *   - 不可解码容器（mpegts 等）→ 前端直接提示下载，不走任何端点播放
  */
 async function handleInlineRelay(
   c: Context<{ Bindings: Env }>,
@@ -782,11 +784,16 @@ async function handleInlineRelay(
     try {
       const target = await cachedStreamUrl(drivers, storage, path);
       if (target) {
-        // 光鸭 CDN 附加浏览器 UA/Referer/Origin；4xx/5xx 或首段 64KB 超 8s 自动重试一次
+        // 诊断开关：仅显式带 probe=1 / debug=1 时才做 64KB 阻塞探测与慢速重试。
+        // 正常播放路径直接透传上游流，首字节延迟 = 上游 TTFB（毫秒级）。
+        const wantProbe =
+          url.searchParams.get('probe') === '1' || url.searchParams.get('debug') === '1';
+        // 光鸭 CDN 附加浏览器 UA/Referer/Origin；4xx/5xx 自动重试一次（诊断时另含慢速重试）
         const upstream = await fetchUpstreamGuarded(target, {
           tag: `stream:${driverNameOf(drivers, storage)}`,
           headers: reqRange ? { Range: reqRange } : {},
           maxAttempts: 2,
+          probeFirst: wantProbe,
           refreshUrl: async () => cachedStreamUrl(drivers, storage, path, true),
         });
         if ((upstream.ok || upstream.status === 206) && upstream.body) {

@@ -770,9 +770,12 @@ function previewUrl(path) {
 }
 
 /**
- * 媒体内联中继 URL（/api/stream）。
- * 光鸭 CDN 对 Range 响应强制带 Content-Disposition: attachment 且无 CORS，
- * 302 后 Worker 无法改写，<video> 拿不到媒体源；改走同源中继由 Worker 重写头部。
+ * 媒体内联中继 URL（/api/stream）——仅作为兜底，不再是默认播放源。
+ *
+ * 实测结论（2026-11）：光鸭 CDN 不支持 inline 覆盖参数，但 `Content-Disposition: attachment`
+ * 不会阻止 <video>/<audio> 按 Content-Type + 206 解码；缺 CORS 只影响 fetch/XHR 拉流。
+ * 而 Worker 中继吞吐仅 1.4~58KB/s，远低于 CDN 直连 ~200KB/s（838kbps 视频仅需 ~105KB/s）。
+ * 因此默认播放走 /api/preview 302 直连；只有直连触发 error 时才有一次改指本端点的重试。
  */
 function streamUrl(path) {
   const auth = creds ? btoa(`${creds.user}:${creds.pass}`) : '';
@@ -811,6 +814,48 @@ function renderUnplayable(box, path, probe) {
 }
 
 const STALL_HINT_TIMEOUT = 15000; // 卡顿判定阈值：15 秒无进展即提示
+
+/** 播放彻底失败（直连 + 中继兜底都 error）：给确定结论 + 下载入口，而不是无限黑屏 */
+function renderPlaybackFailed(box, path, size) {
+  box.innerHTML = '';
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'max-width:520px;';
+  const tip = document.createElement('p');
+  tip.style.cssText = 'margin:0 0 10px;line-height:1.7;color:#222;';
+  tip.textContent = '该文件无法在线播放，请下载后观看。';
+  wrap.appendChild(tip);
+  if (size) {
+    const meta = document.createElement('p');
+    meta.style.cssText = 'margin:0 0 12px;color:#666;font-size:12px;';
+    meta.textContent = `大小：${fmtSize(size)}`;
+    wrap.appendChild(meta);
+  }
+  wrap.appendChild(mkBtn('下载该文件', 'btn-sm', () => downloadFile(path, size)));
+  box.appendChild(wrap);
+}
+
+/**
+ * 播放失败兜底链：默认 src 是 /api/preview（302 直连），
+ * 首次 error → 自动改指 /api/stream 中继重试一次；
+ * 中继仍 error → 停止无意义重试，展示「无法在线播放」+ 下载按钮。
+ */
+function attachMediaErrorFallback(media, box, path, size) {
+  let triedRelay = false;
+  let failed = false;
+  media.addEventListener('error', () => {
+    if (failed) return;
+    if (!triedRelay) {
+      triedRelay = true;
+      console.warn('[preview] direct playback failed, retry once via /api/stream:', path);
+      media.src = streamUrl(path);
+      media.load();
+      return;
+    }
+    failed = true;
+    console.warn('[preview] relay playback failed, fallback to download hint:', path);
+    renderPlaybackFailed(box, path, size);
+  });
+}
 
 /** 已缓冲到的最大时间点（秒）；异常时返回 0 */
 function bufferedEnd(media) {
@@ -875,7 +920,7 @@ function attachStallFallback(media, box, path, size) {
   });
   media.addEventListener('playing', clear);
   media.addEventListener('canplay', clear);
-  media.addEventListener('error', () => showHint('该文件无法在线播放，建议下载后观看。'));
+  // error 交由 attachMediaErrorFallback 统一处理（先试中继，仍失败才提示下载），此处不重复提示
   arm();
 }
 
@@ -978,19 +1023,26 @@ async function previewFile(path) {
     const video = document.createElement('video');
     video.controls = true;
     video.preload = 'metadata';
+    video.playsInline = true;
+    video.setAttribute('playsinline', '');
+    video.setAttribute('webkit-playsinline', '');
     video.style.cssText = 'max-width:84vw;max-height:76vh;background:#000;';
-    // 播放走同源内联中继，避免 CDN 的 attachment 头导致 NO_SOURCE 黑屏
-    video.src = streamUrl(path);
+    // 默认走同源 /api/preview（302 到光鸭签名直链）：CDN 直出、首字节毫秒级，
+    // attachment 头不影响 <video> 解码；失败时由 error 兜底切一次 /api/stream 中继
+    video.src = url;
     bodyEl.innerHTML = '';
     bodyEl.appendChild(video);
+    attachMediaErrorFallback(video, bodyEl, path, probe && probe.size);
     attachStallFallback(video, bodyEl, path, probe && probe.size);
   } else if (kind === 'audio') {
     const audio = document.createElement('audio');
     audio.controls = true;
     audio.style.cssText = 'width:72vw;max-width:720px;';
-    audio.src = streamUrl(path);
+    // 音频同样优先直连（/api/preview 302），error 时兜底中继一次
+    audio.src = url;
     bodyEl.innerHTML = '';
     bodyEl.appendChild(audio);
+    attachMediaErrorFallback(audio, bodyEl, path, probe && probe.size);
     attachStallFallback(audio, bodyEl, path, probe && probe.size);
   } else {
     bodyEl.innerHTML = '<p style="margin:0;color:#666;">该类型不支持在线预览，请下载查看。</p>';
