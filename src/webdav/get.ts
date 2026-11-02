@@ -31,8 +31,9 @@ async function readImpl(ctx: DavContext, headOnly: boolean): Promise<Response> {
   const rangeHeader = ctx.request.header('range');
   const range = parseRange(rangeHeader, stat.size);
 
-  const stream = await ctx.storage.read(ctx.path, range ?? undefined);
-  if (!stream) {
+  // HEAD 只回元数据：不发上游读请求（避免白跑一次真实下载/换签名）
+  const stream = headOnly ? null : await ctx.storage.read(ctx.path, range ?? undefined);
+  if (!headOnly && !stream) {
     throw new DavError(404, 'Not found', undefined);
   }
 

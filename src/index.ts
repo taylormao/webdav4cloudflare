@@ -70,9 +70,11 @@ app.all('*', async (c) => {
 
   // ------------------------------------------------------------------
   // 1) 管理 API（均需认证）
+  //    auth query（base64(user:pass)）优先：<video>/<audio>/<img>/<iframe> 等
+  //    标签加载子资源时无法附加 Authorization 头，只能靠 query 传凭据。
   // ------------------------------------------------------------------
   if (rawPath.startsWith('/api/')) {
-    const authed = await requireAuth(c, config.auth);
+    const authed = await requireAuthFlexible(c, config.auth, url.searchParams.get('auth'));
     if (!authed) {
       return c.text('Unauthorized', 401, {
         'WWW-Authenticate': 'Basic realm="WebDAV Cloud Drive"',
@@ -81,13 +83,15 @@ app.all('*', async (c) => {
 
     // 管理 API 使用的路径一律带驱动分区前缀（/api/download?path=/gdrive/xxx）
     const drivers = createDrivers(config, c.env);
+    // 日志归因：按 path 参数解析真实驱动名，避免统一记成主存储类型
+    const apiStorageLabel = resolveApiStorageLabel(url, drivers, config.storageType);
     try {
       let res: Response;
       // 自动登录获取凭据服务：/api/auth/<driver>/<action>（登录框架，AUTH_PROVIDERS 注册表）
       const authRoute = parseAuthPath(rawPath);
       if (authRoute) {
         res = await handleAuthApi(c, authRoute);
-        finishLog(c, logger, { method, path: rawPath, status: res.status, durationMs: Date.now() - start, storage: config.storageType });
+        finishLog(c, logger, { method, path: rawPath, status: res.status, durationMs: Date.now() - start, storage: apiStorageLabel });
         return res;
       }
       switch (rawPath) {
@@ -120,13 +124,13 @@ app.all('*', async (c) => {
         default:
           res = c.json({ error: 'Not found' }, 404);
       }
-      finishLog(c, logger, { method, path: rawPath, status: res.status, durationMs: Date.now() - start, storage: config.storageType });
+      finishLog(c, logger, { method, path: rawPath, status: res.status, durationMs: Date.now() - start, storage: apiStorageLabel });
       return res;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`[api] ${method} ${rawPath} failed:`, e);
       const res = c.text(`Internal error: ${msg}`, 500);
-      finishLog(c, logger, { method, path: rawPath, status: 500, durationMs: Date.now() - start, storage: config.storageType });
+      finishLog(c, logger, { method, path: rawPath, status: 500, durationMs: Date.now() - start, storage: apiStorageLabel });
       return res;
     }
   }
@@ -191,13 +195,13 @@ app.all('*', async (c) => {
 
   try {
     const res = await dispatch(ctx);
-    finishLog(c, logger, { method, path: rawPath, status: res.status, durationMs: Date.now() - start, storage: config.storageType });
+    finishLog(c, logger, { method, path: rawPath, status: res.status, durationMs: Date.now() - start, storage: resolved.driverName });
     return res;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error(`[webdav] ${method} ${resolved.path} failed:`, e);
     const res = c.text(`Internal error: ${msg}`, 500);
-    finishLog(c, logger, { method, path: rawPath, status: 500, durationMs: Date.now() - start, storage: config.storageType });
+    finishLog(c, logger, { method, path: rawPath, status: 500, durationMs: Date.now() - start, storage: resolved.driverName });
     return res;
   }
 });
@@ -447,6 +451,22 @@ function resolveApiPath(
   return null;
 }
 
+/** 管理 API 日志归因：从 path 参数解析出真实驱动分区名（用于修正日志 storage 字段） */
+function resolveApiStorageLabel(
+  url: URL,
+  drivers: Map<string, StorageDriver>,
+  fallback: string
+): string {
+  const p = url.searchParams.get('path');
+  if (!p) return fallback;
+  const api = resolveApiPath(p, drivers);
+  if (!api) return fallback;
+  for (const [name, driver] of drivers) {
+    if (driver === api.storage) return name;
+  }
+  return fallback;
+}
+
 /** MOVE/COPY Destination 解析：仅允许同驱动内部路径，跨驱动返回 null */
 function resolveInnerPath(
   externalPath: string,
@@ -494,6 +514,30 @@ async function handleVirtualRootPropfind(
   });
 }
 
+/** 直连重定向阈值：达到该大小才考虑 302 到上游直链 */
+const REDIRECT_MIN_SIZE = 4 * 1024 * 1024;
+
+/**
+ * 是否对本次请求返回 302 直链。
+ * - 文本预览需在 Worker 侧截断，不能直连
+ * - 媒体（video/audio）在 preview 下自动直连：浏览器会持续发 Range，代理每次都要重新回源，体验极差
+ * - 其他类型（PDF/图片/压缩包等）仅在显式 redirect=1 时直连，避免上游直链自带
+ *   Content-Disposition: attachment 破坏 iframe/img 的 inline 预览
+ */
+function shouldRedirect(
+  url: URL,
+  disposition: 'attachment' | 'inline',
+  contentType: string,
+  textLike: boolean,
+  size: number
+): boolean {
+  if (textLike) return false;
+  const explicit = url.searchParams.get('redirect') === '1';
+  const isMedia = /^(video|audio)\//.test(contentType);
+  if (disposition === 'inline' && isMedia) return true;
+  return explicit && (isMedia || size >= REDIRECT_MIN_SIZE);
+}
+
 /** /api/download 与 /api/preview 的通用流式响应 */
 async function handleApiStream(
   c: Context<{ Bindings: Env }>,
@@ -511,6 +555,38 @@ async function handleApiStream(
   const stat = await storage.stat(path);
   if (!stat || stat.isDirectory) return c.text('Not found', 404);
 
+  // Google 原生格式（doc/sheet/...）：read() 已自动导出，Content-Type 用导出 MIME
+  let contentType = stat.contentType ?? guessMime(path) ?? 'application/octet-stream';
+  if (stat.contentType && stat.contentType.startsWith('application/vnd.google-apps.')) {
+    contentType = nativeExportMime(stat.contentType, path);
+  }
+  const textLike = isTextContent(contentType, path);
+
+  // 直连上游（302）：媒体与大文件不再经 Worker 逐字节代理。
+  // 浏览器拿到签名直链后直连对象存储，首字节与拖动 seek 均不再受 Worker 往返与上游限速叠加影响。
+  // - /api/preview（inline）默认启用；/api/download 需显式 redirect=1（前端失败可回退代理）
+  if (shouldRedirect(url, opts.disposition, contentType, textLike, stat.size)) {
+    try {
+      const target = await storage.directUrl?.(path);
+      if (target) {
+        const redirectHeaders: Record<string, string> = {
+          Location: target,
+          // 短缓存：减少重复 302 与签名换取，同时保证签名过期前会被刷新
+          'Cache-Control': 'private, max-age=30',
+        };
+        if (opts.disposition === 'attachment') {
+          // 浏览器直接导航到该地址时仍按附件下载，而非内联播放
+          redirectHeaders['Content-Disposition'] =
+            `attachment; filename*=UTF-8''${encodeURIComponent(baseName(path))}`;
+        }
+        return new Response(null, { status: 302, headers: redirectHeaders });
+      }
+    } catch (e) {
+      // 换取直链失败（签名接口异常 / 驱动不支持）→ 回退代理，不影响可用性
+      console.warn('[api] direct link unavailable, fallback to proxy:', e);
+    }
+  }
+
   const range = parseRange(c.req.header('range'), stat.size);
   let stream: ReadableStream | null;
   try {
@@ -521,12 +597,6 @@ async function handleApiStream(
     throw e;
   }
   if (stream === null) return c.text('Not found', 404);
-
-  // Google 原生格式（doc/sheet/...）：read() 已自动导出，Content-Type 用导出 MIME
-  let contentType = stat.contentType ?? guessMime(path) ?? 'application/octet-stream';
-  if (stat.contentType && stat.contentType.startsWith('application/vnd.google-apps.')) {
-    contentType = nativeExportMime(stat.contentType, path);
-  }
 
   const headers = new Headers({
     'Content-Type': contentType,

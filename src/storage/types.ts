@@ -49,6 +49,15 @@ export interface StorageDriver {
   /** 读取文件内容流；支持可选 Range */
   read(path: string, range?: Range): Promise<ReadableStream | null>;
 
+  /**
+   * 可选能力：获取对象存储的签名直链（如光鸭 signedURL）。
+   *
+   * 返回非空字符串时，/api/preview 等接口可返回 302 让浏览器直连上游拉流，
+   * 避免 Worker 逐字节代理（省请求、省 CPU，速度取决于上游对客户端带宽）。
+   * 返回 null 或抛错表示不支持/不可用，调用方回退到 read() 代理转发。
+   */
+  directUrl?(path: string): Promise<string | null>;
+
   /** 写入文件（覆盖或新建） */
   write(path: string, body: ReadableStream | ArrayBuffer, opts?: WriteOptions): Promise<void>;
 

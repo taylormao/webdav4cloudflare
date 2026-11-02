@@ -551,6 +551,49 @@ async function downloadDirect(path) {
   }
 }
 
+/** 读取一个 Range 响应并按块回调字节数（流式累加进度，不等整片 blob 完成） */
+async function readRangeStream(url, s, e, onBytes) {
+  const res = await fetch(url, {
+    headers: { ...authHeader(), Range: `bytes=${s}-${e}` },
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.body || !res.body.getReader) {
+    const blob = await res.blob();
+    if (onBytes) onBytes(blob.size);
+    return blob;
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (value && value.length) {
+      chunks.push(value);
+      if (onBytes) onBytes(value.length);
+    }
+  }
+  return new Blob(chunks);
+}
+
+/**
+ * 取一个分片：优先请求 redirect=1 让浏览器直连对象存储（绕开 Worker 代理限速）；
+ * 直连因 CORS/签名问题失败时，回退到 Worker 代理路径重取该片。
+ * onRollback(n) 用于回滚失败尝试中已经计入的字节数。
+ */
+async function fetchChunk(path, s, e, onBytes, onRollback) {
+  const base = `/api/download?path=${encodeURIComponent(path)}`;
+  let added = 0;
+  try {
+    return await readRangeStream(`${base}&redirect=1`, s, e, (n) => {
+      added += n;
+      onBytes(n);
+    });
+  } catch (err) {
+    if (added && onRollback) onRollback(added);
+    return await readRangeStream(base, s, e, onBytes);
+  }
+}
+
 /** 大文件分片并发下载（Range 请求，拼接 Blob 保存） */
 async function downloadChunked(path, size) {
   let chunk = Math.ceil(size / CHUNK_CONCURRENCY);
@@ -574,13 +617,28 @@ async function downloadChunked(path, size) {
         const i = next++;
         if (i >= ranges.length) return;
         const [s, e] = ranges[i];
-        const res = await fetch(`/api/download?path=${encodeURIComponent(path)}`, {
-          headers: { ...authHeader(), Range: `bytes=${s}-${e}` },
-        });
-        if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-        parts[i] = await res.blob();
-        done += e - s + 1;
-        prog.update(done, size);
+        const expect = e - s + 1;
+        let added = 0;
+        parts[i] = await fetchChunk(
+          path,
+          s,
+          e,
+          (n) => {
+            added += n;
+            done += n;
+            prog.update(done, size);
+          },
+          (n) => {
+            added -= n;
+            done -= n;
+            prog.update(done, size);
+          }
+        );
+        // 服务端返回字节数与预期不符时补齐差额，避免进度卡在 99%
+        if (added !== expect) {
+          done += expect - added;
+          prog.update(done, size);
+        }
       }
     };
     await Promise.all(Array.from({ length: Math.min(CHUNK_CONCURRENCY, ranges.length) }, worker));
@@ -603,7 +661,7 @@ function saveBlob(blob, filename) {
   URL.revokeObjectURL(url);
 }
 
-/** 分片下载整体进度条 */
+/** 分片下载整体进度条（含实时速度） */
 function showDownloadProgress() {
   const box = document.createElement('div');
   box.className = 'download-progress';
@@ -616,13 +674,33 @@ function showDownloadProgress() {
   bar.value = 0;
   const pct = document.createElement('span');
   pct.textContent = '0%';
-  box.append(label, bar, pct);
+  const speed = document.createElement('span');
+  speed.style.cssText = 'color:#666;min-width:74px;text-align:right;';
+  speed.textContent = '--';
+  box.append(label, bar, pct, speed);
   document.body.appendChild(box);
+
+  const startedAt = Date.now();
+  let lastAt = startedAt;
+  let lastDone = 0;
+  const fmt = (bytesPerSec) => {
+    if (!bytesPerSec || bytesPerSec < 1) return '--';
+    if (bytesPerSec >= 1024 * 1024) return (bytesPerSec / 1024 / 1024).toFixed(2) + ' MB/s';
+    return (bytesPerSec / 1024).toFixed(0) + ' KB/s';
+  };
   return {
     update(done, total) {
       const v = Math.round((done / total) * 100);
       bar.value = v;
       pct.textContent = v + '%';
+      const now = Date.now();
+      // 采样间隔 500ms，速度用区间增量计算，避免抖动
+      if (now - lastAt >= 500) {
+        const inst = ((done - lastDone) * 1000) / (now - lastAt);
+        speed.textContent = fmt(inst);
+        lastAt = now;
+        lastDone = done;
+      }
     },
     remove() {
       box.remove();

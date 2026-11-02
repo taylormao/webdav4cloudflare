@@ -32,8 +32,65 @@ import { readKvDriverConfig } from '../kv-config';
 const ACCOUNT_BASE_URL = 'https://account.guangyapan.com';
 const API_BASE_URL = 'https://api.guangyapan.com';
 
-/** 同一 API 端点的最小请求间隔（Go: apiRateInterval = 500ms） */
+/** 写操作同一 API 端点的最小请求间隔（Go: apiRateInterval = 500ms） */
 const API_RATE_INTERVAL = 500;
+/** 只读端点（列目录 / 换下载直链）的最小间隔，可放宽以缩短首字节时间 */
+const API_RATE_INTERVAL_READ = 120;
+
+/** 只读端点集合（放宽节流；写操作仍保持 500ms 防风控） */
+const READ_ONLY_ENDPOINTS = new Set<string>([
+  '/userres/v1/file/get_file_list',
+  '/nd.bizuserres.s/v1/get_res_download_url',
+]);
+
+/** 目录节点（path → fileId）缓存 TTL：跨请求复用，免去逐级翻页解析 */
+const NODE_CACHE_TTL = 10 * 60 * 1000;
+/** 签名直链缓存 TTL：覆盖分片并发/拖动重连的短时窗口，同时短于上游签名有效期，避免下发失效链接 */
+const URL_CACHE_TTL = 110 * 1000;
+/** 缓存条目上限（超限淘汰最早插入项，防 Worker 内存膨胀） */
+const CACHE_MAX_ENTRIES = 2000;
+/** 单次列目录最大翻页数（防御异常 total） */
+const MAX_LIST_PAGES = 10000;
+
+// ===========================================================================
+// 模块级缓存（同一 Worker isolate 内跨请求共享）
+// ===========================================================================
+interface TimedEntry<T> {
+  value: T;
+  expiresAt: number;
+}
+
+const nodeCacheStore = new Map<string, TimedEntry<ResolveCache>>();
+const urlCacheStore = new Map<string, TimedEntry<string>>();
+const rootCacheStore = new Map<string, TimedEntry<string>>();
+const apiRateLimitStore = new Map<string, number>();
+/** 同一路径的并发解析去重（singleflight）：分片并发/多 Range 重连时避免重复逐级翻页 */
+const inflightNodeStore = new Map<string, Promise<ResolveCache>>();
+
+function cacheGet<T>(store: Map<string, TimedEntry<T>>, key: string): T | undefined {
+  const hit = store.get(key);
+  if (!hit) return undefined;
+  if (hit.expiresAt <= Date.now()) {
+    store.delete(key);
+    return undefined;
+  }
+  return hit.value;
+}
+
+function cacheSet<T>(store: Map<string, TimedEntry<T>>, key: string, value: T, ttl: number): void {
+  if (store.size >= CACHE_MAX_ENTRIES && !store.has(key)) {
+    const oldest = store.keys().next();
+    if (!oldest.done) store.delete(oldest.value);
+  }
+  store.set(key, { value, expiresAt: Date.now() + ttl });
+}
+
+/** 删除某前缀下的全部缓存（目录变更后失效子树） */
+function cacheDeleteByPrefix<T>(store: Map<string, TimedEntry<T>>, prefix: string): void {
+  for (const k of [...store.keys()]) {
+    if (k.startsWith(prefix)) store.delete(k);
+  }
+}
 
 /** 默认分页大小（Go: PageSize <= 0 时 100） */
 const DEFAULT_PAGE_SIZE = 100;
@@ -160,8 +217,8 @@ export class GuangYaPanDriver implements StorageDriver {
   private resolvedRootFolderId = '';
   private rootFolderResolved = false;
 
-  /** 每 endpoint 最近请求时间（Go: apiRateLimit） */
-  private apiRateLimit = new Map<string, number>();
+  /** 每 endpoint 最近请求时间（Go: apiRateLimit；进程内共享，避免多请求绕过节流） */
+  private apiRateLimit = apiRateLimitStore;
 
   constructor(private cfg: GuangYaPanConfig, private driverConfigKv?: KVNamespace) {
     const clientId = (cfg.clientId ?? '').trim();
@@ -281,13 +338,15 @@ export class GuangYaPanDriver implements StorageDriver {
     };
   }
 
-  /** 每 endpoint 最小间隔节流（Go: apiRateLimitWait） */
+  /** 每 endpoint 最小间隔节流（Go: apiRateLimitWait；只读端点用更短间隔） */
   private async apiRateLimitWait(path: string): Promise<void> {
+    const interval = READ_ONLY_ENDPOINTS.has(path) ? API_RATE_INTERVAL_READ : API_RATE_INTERVAL;
+    const key = this.clientId + '|' + path;
     const now = Date.now();
-    const last = this.apiRateLimit.get(path) ?? 0;
-    const wait = API_RATE_INTERVAL - (now - last);
+    const last = this.apiRateLimit.get(key) ?? 0;
+    const wait = interval - (now - last);
     if (wait > 0) await sleep(wait);
-    this.apiRateLimit.set(path, Date.now());
+    this.apiRateLimit.set(key, Date.now());
   }
 
   /** 业务 POST：Bearer 鉴权，401/403 时刷新 token 重试一次（Go: postAPI） */
@@ -325,31 +384,61 @@ export class GuangYaPanDriver implements StorageDriver {
   // -------------------------------------------------------------------------
   // 光鸭 API
   // -------------------------------------------------------------------------
+  /** 取单页目录列表（getFileList / findChildEntry 复用，避免重复代码） */
+  private async fetchListPage(
+    parentId: string,
+    page: number
+  ): Promise<{ total: number; list: FileItem[] }> {
+    const json = await this.postAPI<ListResp>('/userres/v1/file/get_file_list', {
+      parentId,
+      page,
+      pageSize: this.pageSize,
+      orderBy: this.orderBy,
+      sortType: this.sortType,
+    });
+    const data = json.data ?? ({} as { total: number; list?: FileItem[] });
+    return { total: data.total ?? 0, list: data.list ?? [] };
+  }
+
   private async getFileList(parentId: string): Promise<FileItem[]> {
     const items: FileItem[] = [];
-    for (let page = 0; page < 10000; page++) {
-      const json = await this.postAPI<ListResp>('/userres/v1/file/get_file_list', {
-        parentId,
-        page,
-        pageSize: this.pageSize,
-        orderBy: this.orderBy,
-        sortType: this.sortType,
-      });
-      const data = json.data ?? ({} as { total: number; list?: FileItem[] });
-      const list = data.list ?? [];
+    for (let page = 0; page < MAX_LIST_PAGES; page++) {
+      const { total, list } = await this.fetchListPage(parentId, page);
       for (const item of list) items.push(item);
       if (list.length < this.pageSize) break;
-      if (data.total > 0 && items.length >= data.total) break;
+      if (total > 0 && items.length >= total) break;
     }
     return items;
   }
 
-  private async getDownloadUrl(fileId: string): Promise<string> {
+  /**
+   * 按名称在目录下查找子项：逐页扫描，**命中即停**（不再拉完整目录）。
+   * 深层路径解析时，每级通常只需 1 页请求（目录内按名称唯一）。
+   */
+  private async findChildEntry(parentId: string, name: string): Promise<FileItem | null> {
+    for (let page = 0; page < MAX_LIST_PAGES; page++) {
+      const { total, list } = await this.fetchListPage(parentId, page);
+      for (const item of list) {
+        if (item.fileName === name) return item;
+      }
+      if (list.length < this.pageSize) return null;
+      if (total > 0 && page * this.pageSize + list.length >= total) return null;
+    }
+    return null;
+  }
+
+  private async getDownloadUrl(fileId: string, refresh = false): Promise<string> {
+    const key = this.clientId + '|' + fileId;
+    if (!refresh) {
+      const cached = cacheGet(urlCacheStore, key);
+      if (cached) return cached;
+    }
     const json = await this.postAPI<DownloadResp>('/nd.bizuserres.s/v1/get_res_download_url', {
       fileId,
     });
     const url = (json.data?.signedURL ?? '').trim() || (json.data?.downloadUrl ?? '').trim();
     if (!url) throw new Error('guangyapan: empty download url');
+    cacheSet(urlCacheStore, key, url, URL_CACHE_TTL);
     return url;
   }
 
@@ -397,11 +486,19 @@ export class GuangYaPanDriver implements StorageDriver {
   // -------------------------------------------------------------------------
   private async getRootFolderId(): Promise<string> {
     if (this.rootFolderResolved) return this.resolvedRootFolderId;
+    const rootKey = this.clientId + '|' + this.rootPath;
+    const cached = cacheGet(rootCacheStore, rootKey);
+    if (cached !== undefined) {
+      this.resolvedRootFolderId = cached;
+      this.rootFolderResolved = true;
+      return cached;
+    }
     if (this.rootPath) {
       this.resolvedRootFolderId = await this.resolveFolderPath(this.rootPath);
     } else {
       this.resolvedRootFolderId = '';
     }
+    cacheSet(rootCacheStore, rootKey, this.resolvedRootFolderId, NODE_CACHE_TTL);
     this.rootFolderResolved = true;
     return this.resolvedRootFolderId;
   }
@@ -418,22 +515,8 @@ export class GuangYaPanDriver implements StorageDriver {
   }
 
   private async findChildFolderId(parentId: string, name: string): Promise<string> {
-    for (let page = 0; page < 10000; page++) {
-      const json = await this.postAPI<ListResp>('/userres/v1/file/get_file_list', {
-        parentId,
-        page,
-        pageSize: this.pageSize,
-        orderBy: this.orderBy,
-        sortType: this.sortType,
-      });
-      const data = json.data ?? ({} as { total: number; list?: FileItem[] });
-      const list = data.list ?? [];
-      for (const item of list) {
-        if (item.resType === 2 && item.fileName === name) return item.fileId;
-      }
-      if (list.length < this.pageSize) break;
-      if (data.total > 0 && page * this.pageSize + list.length >= data.total) break;
-    }
+    const item = await this.findChildEntry(parentId, name);
+    if (item && item.resType === 2) return item.fileId;
     if (!parentId) {
       throw new Error(`guangyapan: resolve root folder path failed: folder "${name}" not found under /`);
     }
@@ -442,30 +525,58 @@ export class GuangYaPanDriver implements StorageDriver {
     );
   }
 
-  private async resolveDir(path: string): Promise<ResolveCache> {
-    const node = await this.resolveNode(path);
+  private async resolveDir(path: string, refresh = false): Promise<ResolveCache> {
+    const node = await this.resolveNode(path, refresh);
     if (!node.isDir) throw new Error(`guangyapan: not a directory: ${path}`);
     return node;
   }
 
-  private async resolveNode(path: string): Promise<ResolveCache> {
+  /** 写入节点缓存（模块级，跨请求复用） */
+  private cacheNode(path: string, node: ResolveCache): void {
     const norm = normalizePath(path);
-    const cached = this.resolveCache.get(norm);
-    if (cached) return cached;
+    const key = this.clientId + '|' + norm;
+    this.resolveCache.set(norm, node);
+    cacheSet(nodeCacheStore, key, node, NODE_CACHE_TTL);
+  }
+
+  private async resolveNode(path: string, refresh = false): Promise<ResolveCache> {
+    const norm = normalizePath(path);
+    const cacheKey = this.clientId + '|' + norm;
+    if (!refresh) {
+      const instanceHit = this.resolveCache.get(norm);
+      if (instanceHit) return instanceHit;
+      const sharedHit = cacheGet(nodeCacheStore, cacheKey);
+      if (sharedHit) {
+        this.resolveCache.set(norm, sharedHit);
+        return sharedHit;
+      }
+      // singleflight：并发请求同一路径时只解析一次
+      const inflight = inflightNodeStore.get(cacheKey);
+      if (inflight) return inflight;
+      const task = this.doResolveNode(norm, false).finally(() => {
+        inflightNodeStore.delete(cacheKey);
+      });
+      inflightNodeStore.set(cacheKey, task);
+      return task;
+    }
+    return this.doResolveNode(norm, true);
+  }
+
+  private async doResolveNode(norm: string, refresh: boolean): Promise<ResolveCache> {
     if (norm === '/') {
       const id = await this.getRootFolderId();
       const root: ResolveCache = { id, isDir: true, size: 0, mtime: Date.now(), etag: 'guangyapan-root' };
-      this.resolveCache.set('/', root);
+      this.cacheNode('/', root);
       return root;
     }
     const parent = parentPath(norm);
     const name = baseName(norm);
-    const parentNode = await this.resolveDir(parent);
-    const items = await this.getFileList(parentNode.id);
-    const item = items.find((i) => i.fileName === name);
+    const parentNode = await this.resolveDir(parent, refresh);
+    // 命中即停：不再拉取整个目录的所有分页
+    const item = await this.findChildEntry(parentNode.id, name);
     if (!item) throw new Error(`Not found: ${norm}`);
     const node = this.itemToNode(item);
-    this.resolveCache.set(norm, node);
+    this.cacheNode(norm, node);
     return node;
   }
 
@@ -496,9 +607,20 @@ export class GuangYaPanDriver implements StorageDriver {
 
   private invalidate(path: string): void {
     const norm = normalizePath(path);
+    const prefix = this.clientId + '|';
     for (const k of [...this.resolveCache.keys()]) {
       if (k === norm || (norm === '/' ? k.startsWith('/') : k.startsWith(norm + '/'))) {
         this.resolveCache.delete(k);
+      }
+    }
+    // 同时失效跨请求缓存（子树一起清）
+    for (const store of [nodeCacheStore, urlCacheStore] as Map<string, TimedEntry<unknown>>[]) {
+      for (const k of [...store.keys()]) {
+        if (!k.startsWith(prefix)) continue;
+        const rel = k.slice(prefix.length);
+        if (rel === norm || (norm === '/' ? rel.startsWith('/') : rel.startsWith(norm + '/'))) {
+          store.delete(k);
+        }
       }
     }
   }
@@ -510,7 +632,7 @@ export class GuangYaPanDriver implements StorageDriver {
     const dir = await this.resolveDir(path);
     const items = await this.getFileList(dir.id);
     const entries = items.map((it) => {
-      this.resolveCache.set(joinPath(path, it.fileName), this.itemToNode(it));
+      this.cacheNode(joinPath(path, it.fileName), this.itemToNode(it));
       return this.itemToStat(it, path);
     });
     return { entries, truncated: false };
@@ -540,6 +662,28 @@ export class GuangYaPanDriver implements StorageDriver {
     }
   }
 
+  /**
+   * 取签名直链（供 /api/preview 302 直连，避免 Worker 逐字节代理）。
+   * 目录 / 解析失败返回 null，由调用方回退代理。
+   */
+  async directUrl(path: string): Promise<string | null> {
+    const node = await this.resolveNode(path);
+    if (node.isDir) return null;
+    const url = await this.getDownloadUrl(node.id);
+    // 浏览器（video/img/iframe）在 https 页面会拦截 http 混合内容，非 https 直链一律回退代理
+    return /^https:\/\//i.test(url) ? url : null;
+  }
+
+  /** 向签名直链发起请求，签名过期（401/403/410）时换新直链重试一次 */
+  private async fetchDirect(url: string, fileId: string, headers: Record<string, string>): Promise<Response> {
+    const res = await fetch(url, { headers });
+    if (res.status === 401 || res.status === 403 || res.status === 410) {
+      const fresh = await this.getDownloadUrl(fileId, true);
+      if (fresh !== url) return fetch(fresh, { headers });
+    }
+    return res;
+  }
+
   async read(path: string, range?: Range): Promise<ReadableStream | null> {
     const node = await this.resolveNode(path);
     if (node.isDir) return null;
@@ -548,7 +692,7 @@ export class GuangYaPanDriver implements StorageDriver {
     if (range) {
       headers.Range = `bytes=${range.offset}-${range.offset + range.length - 1}`;
     }
-    const res = await fetch(url, { headers });
+    const res = await this.fetchDirect(url, node.id, headers);
     if (!res.ok) {
       throw new Error(`guangyapan: download failed with ${res.status}`);
     }
