@@ -31,6 +31,7 @@ import { createDrivers, type DriverEnv } from './storage/registry';
 import { requireAuth, requireAuthFlexible } from './auth';
 import { handleAuthApi, parseAuthPath } from './auth/index';
 import { normalizePath, baseName } from './utils/path';
+import { fetchUpstreamGuarded } from './utils/upstream';
 import { dispatch } from './webdav/router';
 import { buildOptionsResponse } from './webdav/options';
 import { parseRange } from './webdav/get';
@@ -670,6 +671,52 @@ async function handleApiStream(
 }
 
 /**
+ * /api/stream 签名直链缓存（isolate 内共享）。
+ *
+ * TTL 与 guangyapan 驱动的 URL_CACHE_TTL（110s）对齐：视频播放会连续发起大量
+ * Range 请求，若每次都用不同签名（URL 带不同的 OSS 签名参数），CDN 缓存键随之
+ * 变化，每个分片都会重新回源、握手，表现为吞吐进一步下降。缓存后同一文件在
+ * TTL 内复用同一签名直链，命中 CDN 边缓存。
+ */
+const STREAM_URL_CACHE_TTL = 110 * 1000;
+const STREAM_URL_CACHE_MAX = 300;
+const streamUrlCache = new Map<string, { url: string; expiresAt: number }>();
+
+/** 取驱动分区名（用于拼缓存键，避免不同驱动的同名路径互相污染） */
+function driverNameOf(drivers: Map<string, StorageDriver>, storage: StorageDriver): string {
+  for (const [name, driver] of drivers) {
+    if (driver === storage) return name;
+  }
+  return 'default';
+}
+
+/** 取（或缓存）某文件的签名直链；force=true 时强制重新签名 */
+async function cachedStreamUrl(
+  drivers: Map<string, StorageDriver>,
+  storage: StorageDriver,
+  path: string,
+  force = false
+): Promise<string | null> {
+  if (!storage.directUrl) return null;
+  const key = driverNameOf(drivers, storage) + '|' + path;
+  if (force) {
+    streamUrlCache.delete(key);
+  } else {
+    const hit = streamUrlCache.get(key);
+    if (hit && hit.expiresAt > Date.now()) return hit.url;
+    if (hit) streamUrlCache.delete(key);
+  }
+  const fresh = await storage.directUrl(path);
+  if (!fresh) return null;
+  if (streamUrlCache.size >= STREAM_URL_CACHE_MAX && !streamUrlCache.has(key)) {
+    const oldest = streamUrlCache.keys().next();
+    if (!oldest.done) streamUrlCache.delete(oldest.value);
+  }
+  streamUrlCache.set(key, { url: fresh, expiresAt: Date.now() + STREAM_URL_CACHE_TTL });
+  return fresh;
+}
+
+/**
  * 内联中继：/api/stream —— 供 <video>/<audio> 作为媒体源使用的同源端点。
  *
  * 为什么不能直接用 302 直链：光鸭 CDN 对 Range 响应强制附带
@@ -733,12 +780,16 @@ async function handleInlineRelay(
   // 首选：签名直链 + 上游 fetch（Worker 只搬字节，头部由自己写）
   if (storage.directUrl) {
     try {
-      const target = await storage.directUrl(path);
+      const target = await cachedStreamUrl(drivers, storage, path);
       if (target) {
-        const upstreamInit: RequestInit = { method: 'GET' };
-        if (reqRange) upstreamInit.headers = { Range: reqRange };
-        const upstream = await fetch(target, upstreamInit);
-        if (upstream.ok || upstream.status === 206) {
+        // 光鸭 CDN 附加浏览器 UA/Referer/Origin；4xx/5xx 或首段 64KB 超 8s 自动重试一次
+        const upstream = await fetchUpstreamGuarded(target, {
+          tag: `stream:${driverNameOf(drivers, storage)}`,
+          headers: reqRange ? { Range: reqRange } : {},
+          maxAttempts: 2,
+          refreshUrl: async () => cachedStreamUrl(drivers, storage, path, true),
+        });
+        if ((upstream.ok || upstream.status === 206) && upstream.body) {
           const headers = baseHeaders();
           const status = upstream.status === 206 ? 206 : 200;
           // 上游的 Content-Range / Content-Length / Content-Type 优先（真实切片长度）
@@ -761,7 +812,12 @@ async function handleInlineRelay(
         }
         // 非 2xx：丢弃上游响应体，回退驱动直读
         await upstream.body?.cancel();
-        console.warn('[api/stream] upstream status', upstream.status, '→ fallback to driver read');
+        console.warn(
+          '[api/stream] upstream status',
+          upstream.status,
+          `(attempts=${upstream.attempts}, probe=${upstream.probeMs}ms/${upstream.probedBytes}B)`,
+          '→ fallback to driver read'
+        );
       }
     } catch (e) {
       console.warn('[api/stream] upstream fetch failed, fallback to driver read:', e);

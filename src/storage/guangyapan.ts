@@ -24,6 +24,7 @@
 import type { GuangYaPanConfig } from '../config';
 import type { FileStat, ListResult, Range, StorageDriver, WriteOptions } from './types';
 import { normalizePath, parentPath, baseName, joinPath } from '../utils/path';
+import { fetchUpstreamGuarded, type UpstreamFetchResult } from '../utils/upstream';
 import { readKvDriverConfig } from '../kv-config';
 
 // ===========================================================================
@@ -674,14 +675,25 @@ export class GuangYaPanDriver implements StorageDriver {
     return /^https:\/\//i.test(url) ? url : null;
   }
 
-  /** 向签名直链发起请求，签名过期（401/403/410）时换新直链重试一次 */
-  private async fetchDirect(url: string, fileId: string, headers: Record<string, string>): Promise<Response> {
-    const res = await fetch(url, { headers });
-    if (res.status === 401 || res.status === 403 || res.status === 410) {
-      const fresh = await this.getDownloadUrl(fileId, true);
-      if (fresh !== url) return fetch(fresh, { headers });
-    }
-    return res;
+  /**
+   * 向签名直链发起请求。
+   *
+   * 1) 直链域名属 guangyacdn.com 时统一附加 Chrome UA / Referer / Origin
+   *    （CDN 对非浏览器 UA 的请求会严重限速：实测 1.4~9.6KB/s vs 浏览器 40MB/s）；
+   * 2) 上游 4xx/5xx（含签名过期）或首段 64KB 读取超过 8s 时，自动重试一次；
+   *    签名过期场景重试前先换新直链。
+   */
+  private async fetchDirect(
+    url: string,
+    fileId: string,
+    headers: Record<string, string>
+  ): Promise<UpstreamFetchResult> {
+    return fetchUpstreamGuarded(url, {
+      tag: `guangyapan:${fileId}`,
+      headers,
+      maxAttempts: 2,
+      refreshUrl: async () => this.getDownloadUrl(fileId, true),
+    });
   }
 
   async read(path: string, range?: Range): Promise<ReadableStream | null> {
