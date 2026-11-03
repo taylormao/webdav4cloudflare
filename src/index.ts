@@ -544,6 +544,146 @@ function shouldRedirect(
   return explicit && (isMedia || size >= REDIRECT_MIN_SIZE);
 }
 
+/* ==================== /api/preview 媒体元信息跨 isolate 缓存（Cache API） ==================== */
+
+/**
+ * 播放链路的第二次往返放大：浏览器播放一个视频会连续发几十个 Range 请求，
+ * 每次都要 storage.stat() + storage.directUrl()（光鸭实测单次 1.7s~10s）。
+ * 签名直链本身有效期内可复用，因此把「size / contentType / container / 直链」整体写进
+ * Cloudflare Cache API（caches.default，跨 isolate 共享），命中即直接 302，
+ * 不再回源 stat 与换链；probe=1 命中同一份缓存也能直接给出容器结论，免读文件头。
+ */
+const PREVIEW_META_TTL_S = 240;
+const PREVIEW_META_KEY_PATH = '/__preview-meta/v1';
+
+interface PreviewMetaEntry {
+  size: number;
+  contentType: string;
+  container: MediaContainer;
+  /** 上游签名直链；缺失表示仅缓存了元信息（驱动无 directUrl） */
+  target?: string;
+  cachedAt: number;
+}
+
+/** 取 caches.default；非 Workers 运行时返回 null（全部降级为不走缓存，不影响功能） */
+function previewMetaCache(): Cache | null {
+  try {
+    const store = (globalThis as unknown as { caches?: CacheStorage }).caches;
+    return store?.default ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** 合成缓存键：驱动分区 + 完整 path，避免不同驱动同名路径互相污染 */
+function previewMetaKey(url: URL, driver: string, path: string): string {
+  const key = new URL(PREVIEW_META_KEY_PATH, url.origin);
+  key.searchParams.set('driver', driver);
+  key.searchParams.set('path', path);
+  return key.toString();
+}
+
+/** 读缓存（命中返回元信息，未命中/异常返回 null） */
+async function readPreviewMeta(
+  url: URL,
+  driver: string,
+  path: string
+): Promise<PreviewMetaEntry | null> {
+  const cache = previewMetaCache();
+  if (!cache) return null;
+  try {
+    const hit = await cache.match(previewMetaKey(url, driver, path));
+    if (!hit) return null;
+    const data = (await hit.json()) as PreviewMetaEntry;
+    if (!data || typeof data.size !== 'number' || !data.contentType) return null;
+    // Cache API 的 max-age 只是尽力而为（边缘可能提前淘汰/延后过期），本地再判一次绝对过期
+    if (Date.now() - (data.cachedAt ?? 0) > PREVIEW_META_TTL_S * 1000) return null;
+    return data;
+  } catch (e) {
+    console.warn('[api/preview] meta cache read failed:', e);
+    return null;
+  }
+}
+
+/** 写缓存（TTL 240s，失败仅告警，不影响主流程） */
+async function writePreviewMeta(
+  url: URL,
+  driver: string,
+  path: string,
+  entry: Omit<PreviewMetaEntry, 'cachedAt'>
+): Promise<void> {
+  const cache = previewMetaCache();
+  if (!cache) return;
+  try {
+    const body = JSON.stringify({ ...entry, cachedAt: Date.now() } satisfies PreviewMetaEntry);
+    await cache.put(
+      previewMetaKey(url, driver, path),
+      new Response(body, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Cache-Control': `public, max-age=${PREVIEW_META_TTL_S}`,
+        },
+      })
+    );
+  } catch (e) {
+    console.warn('[api/preview] meta cache write failed:', e);
+  }
+}
+
+/** 失效缓存（refresh=1 或上游换链失败时强制下次重建） */
+async function dropPreviewMeta(url: URL, driver: string, path: string): Promise<void> {
+  const cache = previewMetaCache();
+  if (!cache) return;
+  try {
+    await cache.delete(previewMetaKey(url, driver, path));
+  } catch (e) {
+    console.warn('[api/preview] meta cache delete failed:', e);
+  }
+}
+
+/** probe=1 的 JSON 结论：命中缓存与实时探测共用同一结构 */
+function mediaProbeJson(
+  c: Context<{ Bindings: Env }>,
+  path: string,
+  info: { size: number; contentType: string; container: MediaContainer }
+): Response {
+  const playable =
+    info.container === 'mpegts' ? uaSupportsMpegTs(c.req.header('user-agent') ?? '') : true;
+  return c.json({
+    path,
+    size: info.size,
+    contentType: info.contentType,
+    container: info.container,
+    playable,
+    // 播放链路：前端默认一律 /api/preview 302 直连（CDN 直出，毫秒级 TTFB）；
+    // /api/stream 中继只在直连 error 时兜底重试一次
+    mode: 'direct',
+    // 光鸭驱动只有签名直链（signedURL / downloadUrl），无 HLS / 转码播放地址
+    playUrl: null,
+    hint: !playable && info.container === 'mpegts' ? MPEGTS_HINT : undefined,
+  });
+}
+
+/** 302 到上游签名直链，按 inline / attachment 重写 Content-Disposition */
+function buildUpstreamRedirect(
+  path: string,
+  contentType: string,
+  target: string,
+  disposition: 'attachment' | 'inline'
+): Response {
+  const headers: Record<string, string> = {
+    Location: target,
+    // 短缓存：减少重复 302 换取，同时保证签名过期前会被浏览器刷新
+    'Cache-Control': 'private, max-age=30',
+    // Content-Type 透传：302 无实体，但部分客户端/代理会据此预判资源类型
+    'Content-Type': contentType,
+    'Content-Disposition': `${
+      disposition === 'attachment' ? 'attachment' : 'inline'
+    }; filename*=UTF-8''${encodeURIComponent(baseName(path))}`,
+  };
+  return new Response(null, { status: 302, headers });
+}
+
 /** /api/download 与 /api/preview 的通用流式响应 */
 async function handleApiStream(
   c: Context<{ Bindings: Env }>,
@@ -557,6 +697,58 @@ async function handleApiStream(
   if (!api) return c.text('Not found', 404);
   const { storage, path } = api;
   if (path === '/' || path.endsWith('/')) return c.text('Not a file', 400);
+
+  const inlineMedia = opts.disposition === 'inline';
+  const driverKey = driverNameOf(drivers, storage);
+  const wantProbe = url.searchParams.get('probe') === '1';
+  // refresh=1 / nocache=1：强制失效缓存并重新 stat + 换链（签名过期、前端重试时使用）
+  const forceRefresh =
+    url.searchParams.get('refresh') === '1' || url.searchParams.get('nocache') === '1';
+
+  // ---------- 缓存优先：命中即 302，不再 storage.stat + directUrl ----------
+  if (inlineMedia) {
+    if (forceRefresh) await dropPreviewMeta(url, driverKey, path);
+    const cached = await readPreviewMeta(url, driverKey, path);
+    if (cached) {
+      const cacheType = cached.contentType || guessMime(path) || 'application/octet-stream';
+      const cacheMedia = /^(video|audio)\//.test(cacheType);
+      // 媒体判定以 contentType 为准：.ts/.mts 等歧义扩展名被 sniff 成 video/mp2t 后，
+      // 不能再被扩展名规则（PREVIEW_TEXT_EXTS）拉回文本分支，否则缓存命中会被绕过
+      const cacheTextLike = cacheMedia ? false : isTextContent(cacheType, path);
+      // probe=1 命中同一份缓存：直接回 container/contentType/size，免读文件头
+      if (wantProbe && cacheMedia) {
+        return mediaProbeJson(c, path, {
+          size: cached.size,
+          contentType: cacheType,
+          container: cached.container ?? 'unknown',
+        });
+      }
+      if (
+        !wantProbe &&
+        cacheMedia &&
+        !cacheTextLike &&
+        shouldRedirect(url, opts.disposition, cacheType, cacheTextLike, cached.size)
+      ) {
+        let target = cached.target;
+        if (!target && storage.directUrl) {
+          // 只有元信息没有直链（probe 先写入过）：直接签名回填，仍然免掉 stat
+          target = (await storage.directUrl(path).catch(() => null)) ?? undefined;
+          if (target) {
+            await writePreviewMeta(url, driverKey, path, {
+              size: cached.size,
+              contentType: cacheType,
+              container: cached.container ?? 'unknown',
+              target,
+            });
+          }
+        }
+        if (target) {
+          console.log('[api/preview] meta cache hit:', driverKey, path);
+          return buildUpstreamRedirect(path, cacheType, target, opts.disposition);
+        }
+      }
+    }
+  }
 
   const stat = await storage.stat(path);
   if (!stat || stat.isDirectory) return c.text('Not found', 404);
@@ -581,25 +773,25 @@ async function handleApiStream(
     }
   }
 
-  // 媒体探测（probe=1）：前端在把地址交给 <video> 之前先确认容器，
-  // MPEG-TS 由浏览器内核直接判定「不能在线播放」，避免长时间黑屏无提示。
-  if (url.searchParams.get('probe') === '1') {
+  // 媒体探测（probe=1）：前端改为并行异步探测（3s 超时），只用于判断
+  // 「容器是 mpegts 且当前浏览器不可解码」这一种需要改走下载提示的情形。
+  if (wantProbe) {
     if (container === 'unknown') container = await sniffContainer(storage, path, stat.size);
     if (container === 'unknown' && /mpegts|mp2t/i.test(contentType)) container = 'mpegts';
-    const playable = container === 'mpegts' ? uaSupportsMpegTs(c.req.header('user-agent') ?? '') : true;
-    return c.json({
-      path,
-      size: stat.size,
-      contentType,
-      container,
-      playable,
-      // 播放链路：前端默认一律 /api/preview 302 直连（CDN 直出，毫秒级 TTFB）；
-      // /api/stream 中继只在直连 error 时兜底重试一次，故此处不再区分 stream/direct
-      mode: 'direct',
-      // 光鸭驱动只有签名直链（signedURL / downloadUrl），无 HLS / 转码播放地址
-      playUrl: null,
-      hint: !playable && container === 'mpegts' ? MPEGTS_HINT : undefined,
-    });
+    // 探测结论顺手写进跨 isolate 缓存（只写元信息，不换链以免拖慢探测）：
+    // 后续 probe 命中直接回结论、后续 302 可复用 size/contentType/container。
+    // 若期间已有 302 路径写入过完整条目（含直链），不覆盖，避免把直链冲掉。
+    if (inlineMedia && !textLike && /^(video|audio)\//.test(contentType)) {
+      const existing = await readPreviewMeta(url, driverKey, path);
+      if (!existing) {
+        await writePreviewMeta(url, driverKey, path, {
+          size: stat.size,
+          contentType,
+          container,
+        });
+      }
+    }
+    return mediaProbeJson(c, path, { size: stat.size, contentType, container });
   }
 
   // 直连上游（302）：媒体与大文件不再经 Worker 逐字节代理。
@@ -609,26 +801,20 @@ async function handleApiStream(
     try {
       const target = await storage.directUrl?.(path);
       if (target) {
-        const redirectHeaders: Record<string, string> = {
-          Location: target,
-          // 短缓存：减少重复 302 与签名换取，同时保证签名过期前会被刷新
-          'Cache-Control': 'private, max-age=30',
-          // Content-Type 透传：302 无实体，但部分客户端/代理会据此预判资源类型
-          'Content-Type': contentType,
-        };
-        if (opts.disposition === 'attachment') {
-          // 原生下载：跨域 302 后浏览器会忽略 <a download>，文件名只能靠该头保证
-          redirectHeaders['Content-Disposition'] =
-            `attachment; filename*=UTF-8''${encodeURIComponent(baseName(path))}`;
-        } else {
-          // 预览必须显式 inline：一旦是 attachment，浏览器会把媒体/PDF 当下载而非内联渲染
-          redirectHeaders['Content-Disposition'] =
-            `inline; filename*=UTF-8''${encodeURIComponent(baseName(path))}`;
+        // 连 size/contentType/container 一起写缓存：后续 Range 请求直接 302，免 stat、免换链
+        if (inlineMedia && !textLike && /^(video|audio)\//.test(contentType)) {
+          await writePreviewMeta(url, driverKey, path, {
+            size: stat.size,
+            contentType,
+            container,
+            target,
+          });
         }
-        return new Response(null, { status: 302, headers: redirectHeaders });
+        return buildUpstreamRedirect(path, contentType, target, opts.disposition);
       }
     } catch (e) {
-      // 换取直链失败（签名接口异常 / 驱动不支持）→ 回退代理，不影响可用性
+      // 换取直链失败（签名接口异常 / 上游换链失败）→ 强制失效缓存，避免继续吐旧链
+      if (inlineMedia) await dropPreviewMeta(url, driverKey, path);
       console.warn('[api] direct link unavailable, fallback to proxy:', e);
     }
   }
@@ -794,7 +980,11 @@ async function handleInlineRelay(
           headers: reqRange ? { Range: reqRange } : {},
           maxAttempts: 2,
           probeFirst: wantProbe,
-          refreshUrl: async () => cachedStreamUrl(drivers, storage, path, true),
+          refreshUrl: async () => {
+            // 上游换链（旧签名失效）→ 同步失效 /api/preview 的元信息缓存，避免继续吐旧直链
+            await dropPreviewMeta(url, driverNameOf(drivers, storage), path);
+            return cachedStreamUrl(drivers, storage, path, true);
+          },
         });
         if ((upstream.ok || upstream.status === 206) && upstream.body) {
           const headers = baseHeaders();

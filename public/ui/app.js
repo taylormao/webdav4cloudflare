@@ -782,17 +782,30 @@ function streamUrl(path) {
   return `/api/stream?path=${encodeURIComponent(path)}&auth=${encodeURIComponent(auth)}`;
 }
 
-/** 探测媒体容器（/api/preview?probe=1）：返回 { size, contentType, container, playable, hint } */
-async function probeMedia(path) {
+/** 媒体探测超时（毫秒）：超时按「原媒体」播放，绝不阻塞起播 */
+const PROBE_TIMEOUT_MS = 3000;
+
+/**
+ * 并行异步探测媒体容器（/api/preview?probe=1）。
+ *
+ * 只作为「事后纠正」使用：起播不等待它，超时（3s，AbortController 中断请求）或失败
+ * 一律返回 null，调用方据此按正常媒体播放。返回 { size, contentType, container, playable, hint }
+ */
+async function probeMedia(path, timeoutMs = PROBE_TIMEOUT_MS) {
+  const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
   try {
     const res = await fetch(`/api/preview?path=${encodeURIComponent(path)}&probe=1`, {
       headers: { ...authHeader() },
+      signal: ctrl ? ctrl.signal : undefined,
     });
     if (!res.ok) return null;
     return await res.json();
   } catch (err) {
-    console.warn('[preview] probe failed:', err);
+    console.warn('[preview] probe skipped (timeout/failed):', path, err && err.message ? err.message : err);
     return null;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -924,13 +937,92 @@ function attachStallFallback(media, box, path, size) {
   arm();
 }
 
+/** 文本预览（截断 500KB）：由 previewFile 主流程与歧义 .ts 探测回落共用 */
+async function renderTextPreview(box, path) {
+  box.innerHTML = '<p style="margin:0;color:#666;">加载中…</p>';
+  try {
+    const res = await fetch(`/api/preview?path=${encodeURIComponent(path)}`, {
+      headers: { ...authHeader() },
+    });
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    let txt = await res.text();
+    let truncated = false;
+    if (txt.length > PREVIEW_TEXT_MAX) {
+      txt = txt.slice(0, PREVIEW_TEXT_MAX);
+      truncated = true;
+    }
+    box.innerHTML = '';
+    if (truncated) {
+      const tip = document.createElement('p');
+      tip.style.cssText = 'margin:0 0 8px;color:#b8860b;font-size:12px;';
+      tip.textContent = '文件过大，仅显示前 500KB 内容。';
+      box.appendChild(tip);
+    }
+    const pre = document.createElement('pre');
+    pre.style.cssText =
+      'margin:0;white-space:pre-wrap;word-break:break-all;font-family:Consolas,Menlo,monospace;font-size:13px;line-height:1.5;max-width:84vw;max-height:76vh;';
+    pre.textContent = txt;
+    box.appendChild(pre);
+  } catch (err) {
+    box.innerHTML = `<p style="margin:0;color:#c00;">预览失败：${escapeHtml(err.message)}</p>`;
+  }
+}
+
+/** 歧义扩展名（.ts/.mts/.m2ts）：文本源码 or MPEG-TS 视频 */
+function isAmbiguousTsExt(ext) {
+  return ext === 'ts' || ext === 'mts' || ext === 'm2ts' || ext === 'mpegts';
+}
+
+/**
+ * 容器探测的「并行事后纠正」。
+ *
+ * 起播不等它：媒体元素已经挂上 src 开始加载/播放，探测在后台异步跑（内部 3s
+ * AbortController 超时）。只有一种情况需要接管播放区：
+ *   - 确认 container=mpegts 且当前浏览器不可解码 → 替换为提示 + 下载按钮
+ * 探测超时 / 失败 / 其他容器一律不打扰，继续按原媒体播放。
+ * 歧义扩展名另有回落：探测发现并非 TS 流（实为文本源码）时切回文本预览。
+ */
+function attachContainerProbe(media, box, path, opts) {
+  const ambiguousTs = !!(opts && opts.ambiguousTs);
+  let takenOver = false;
+
+  /** 探测结论需要接管播放区：先释放解码与网络资源，避免后台继续拉流 */
+  const takeOver = () => {
+    if (takenOver) return false;
+    takenOver = true;
+    try {
+      media.pause();
+      media.removeAttribute('src');
+      media.load();
+    } catch {
+      /* 元素已移除等异常忽略 */
+    }
+    return true;
+  };
+
+  probeMedia(path)
+    .then((probe) => {
+      if (!probe || takenOver) return; // 超时 / 失败：按原媒体播放
+      if (probe.container === 'mpegts') {
+        // Safari（AVFoundation 自带 mpegts demuxer）playable=true，继续播放
+        if (probe.playable === false && takeOver()) renderUnplayable(box, path, probe);
+        return;
+      }
+      if (ambiguousTs && takeOver()) renderTextPreview(box, path);
+    })
+    .catch(() => {
+      /* 探测异常不影响播放 */
+    });
+}
+
 /** 在线预览：文本/图片/PDF/视频/音频在模态框展示，其余提示下载 */
 async function previewFile(path) {
   const name = path.split('/').filter(Boolean).pop() || 'download';
   const ext = extOf(name);
 
-  // .ts / .mts / .m2ts 扩展名有歧义：TypeScript 源码 or MPEG-TS 视频，需探测文件头才能定性
-  const ambiguousTs = ext === 'ts' || ext === 'mts' || ext === 'm2ts' || ext === 'mpegts';
+  // .ts / .mts / .m2ts 扩展名有歧义：TypeScript 源码 or MPEG-TS 视频，需探测文件头才能定性。
+  // 现在不再为定性而阻塞起播：先按视频播放，探测结果回来再纠正。
+  const ambiguousTs = isAmbiguousTsExt(ext);
 
   let kind;
   if (PREVIEW_IMG_EXTS.has(ext)) kind = 'image';
@@ -965,49 +1057,14 @@ async function previewFile(path) {
 
   const bodyEl = overlay.querySelector('.preview-body');
 
-  // 媒体与有歧义的 .ts 先探测容器：MPEG-TS 只有 Safari 能解，Chrome/Edge 必然黑屏报 code=4，
-  // 因此不再把地址直接丢给 <video> 让它静默失败，而是当场给结论 + 下载入口。
-  let probe = null;
-  if (kind === 'video' || kind === 'audio' || ambiguousTs) {
-    bodyEl.innerHTML = '<p style="margin:0;color:#666;">正在检测媒体容器…</p>';
-    probe = await probeMedia(path);
-    if (probe && probe.container === 'mpegts') {
-      if (probe.playable === false) {
-        renderUnplayable(bodyEl, path, probe);
-        return;
-      }
-      // Safari（AVFoundation 自带 mpegts demuxer）可解，按视频播放
-      if (kind === 'text') kind = 'video';
-    }
-  }
+  // 起播不再等待容器探测：video/audio 直接挂 src 播放，容器探测并行异步执行（3s 超时）。
+  // 只有确认「container=mpegts 且当前浏览器不可解码」时才替换为提示 + 下载入口；
+  // 探测超时 / 失败一律按原媒体播放。歧义扩展名（.ts/.mts/.m2ts）同样先按视频播放，
+  // 探测回来若并非 TS 流再切回文本预览。
+  if (ambiguousTs) kind = 'video';
 
   if (kind === 'text') {
-    bodyEl.innerHTML = '<p style="margin:0;color:#666;">加载中…</p>';
-    try {
-      const res = await fetch(`/api/preview?path=${encodeURIComponent(path)}`, {
-        headers: { ...authHeader() },
-      });
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      let txt = await res.text();
-      let truncated = false;
-      if (txt.length > PREVIEW_TEXT_MAX) {
-        txt = txt.slice(0, PREVIEW_TEXT_MAX);
-        truncated = true;
-      }
-      bodyEl.innerHTML = '';
-      if (truncated) {
-        const tip = document.createElement('p');
-        tip.style.cssText = 'margin:0 0 8px;color:#b8860b;font-size:12px;';
-        tip.textContent = '文件过大，仅显示前 500KB 内容。';
-        bodyEl.appendChild(tip);
-      }
-      const pre = document.createElement('pre');
-      pre.style.cssText = 'margin:0;white-space:pre-wrap;word-break:break-all;font-family:Consolas,Menlo,monospace;font-size:13px;line-height:1.5;max-width:84vw;max-height:76vh;';
-      pre.textContent = txt;
-      bodyEl.appendChild(pre);
-    } catch (err) {
-      bodyEl.innerHTML = `<p style="margin:0;color:#c00;">预览失败：${escapeHtml(err.message)}</p>`;
-    }
+    await renderTextPreview(bodyEl, path);
   } else if (kind === 'image') {
     const img = document.createElement('img');
     img.style.cssText = 'max-width:84vw;max-height:76vh;object-fit:contain;';
@@ -1032,8 +1089,10 @@ async function previewFile(path) {
     video.src = url;
     bodyEl.innerHTML = '';
     bodyEl.appendChild(video);
-    attachMediaErrorFallback(video, bodyEl, path, probe && probe.size);
-    attachStallFallback(video, bodyEl, path, probe && probe.size);
+    attachMediaErrorFallback(video, bodyEl, path, null);
+    attachStallFallback(video, bodyEl, path, null);
+    // 探测并行执行：不阻塞起播，仅在确认不可解码时接管为提示 + 下载
+    attachContainerProbe(video, bodyEl, path, { ambiguousTs });
   } else if (kind === 'audio') {
     const audio = document.createElement('audio');
     audio.controls = true;
@@ -1042,8 +1101,9 @@ async function previewFile(path) {
     audio.src = url;
     bodyEl.innerHTML = '';
     bodyEl.appendChild(audio);
-    attachMediaErrorFallback(audio, bodyEl, path, probe && probe.size);
-    attachStallFallback(audio, bodyEl, path, probe && probe.size);
+    attachMediaErrorFallback(audio, bodyEl, path, null);
+    attachStallFallback(audio, bodyEl, path, null);
+    attachContainerProbe(audio, bodyEl, path, { ambiguousTs: false });
   } else {
     bodyEl.innerHTML = '<p style="margin:0;color:#666;">该类型不支持在线预览，请下载查看。</p>';
   }
